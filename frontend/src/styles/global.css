@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+/* ===== CloudRAG-Hub Global Styles ===== */
+
+html,
+body {
+  background: #ffffff;
+  color: #000000;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #000000; border-radius: 0; }
+::-webkit-scrollbar-thumb:hover { background: #525252; }
+
+/* Typewriter cursor animation */
+@keyframes blink-cursor {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.cursor-blink::after {
+  content: '█';
+  animation: blink-cursor 0.8s infinite;
+}
+
+/* SSE streaming fade-in for new tokens */
+@keyframes fade-token {
+  from { opacity: 0.6; }
+  to { opacity: 1; }
+}
+.token-new {
+  animation: fade-token 0.1s linear;
+}
+
+/* Mobile safe area padding */
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
+.safe-top { padding-top: env(safe-area-inset-top, 0px); }
+
+/* Hide scrollbars without disabling scrolling. */
+.scrollbar-none {
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* Minimal monochrome page transitions */
+.page-enter { opacity: 0; }
+.page-enter-active { opacity: 1; transition: opacity 0.1s linear; }
