@@ -26,7 +26,6 @@ CloudRAG-Hub 是一个面向 Dify Chatflow 的本地 RAG 网关与 Web 控制台
 └── .env.example                     # 环境变量模板，不包含真实密钥
 ```
 
-`其他/` 文件夹是本地参考资料，已经在 `.gitignore` 中忽略，不会上传到 GitHub。
 
 ## 环境要求
 
