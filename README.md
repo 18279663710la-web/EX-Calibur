@@ -1,6 +1,7 @@
 # Excalibur
 
 Excalibur是一个个人文件检索助手，以Dify Chatflow为底座，在web页面中能进行文件上传、打开、以及RAG检索文件内容操作，移动端以微信作为交互通道。
+<img width="2527" height="1330" alt="image" src="https://github.com/user-attachments/assets/78036e7c-cc7b-4253-887e-69e3465d6231" />
 
 ## 主要功能
 
