@@ -1,6 +1,6 @@
-# CloudRAG-Hub
+# Excalibur
 
-CloudRAG-Hub 是一个面向 Dify Chatflow 的本地 RAG 网关与 Web 控制台。项目后端只负责接收用户消息或文件、转发到 Dify、再把 Dify 的结果返回给前端；复杂的检索、分类、知识库处理和工作流逻辑都放在 Dify 中完成。前端保持黑白线框风格，提供知识库对话、通道管理、文件上传和数据看板等页面。
+Excalibur是一个个人文件检索助手，以Dify Chatflow为底座，在web页面中能进行文件上传、打开、以及RAG检索文件内容操作，移动端以微信作为交互通道。
 
 ## 主要功能
 
