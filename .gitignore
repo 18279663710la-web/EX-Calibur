@@ -5,10 +5,14 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # IDE
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 
@@ -17,14 +21,18 @@ venv/
 .env.local
 .env.*.local
 *.env
+!.env.example
 
 # Build output
 dist/
 .svelte-kit/
+coverage/
+htmlcov/
 
 # Docker volumes
 postgres_data/
 uploads/
+uploads_data/
 
 # OS
 .DS_Store
@@ -33,3 +41,16 @@ desktop.ini
 
 # Logs
 *.log
+
+# Local sync/runtime artifacts
+sync_ledger*.json
+dify_backups/
+backend/uploads/
+frontend/node_modules/
+
+# Intermediate generated knowledge artifacts.
+# Keep structured_markdown_retrieval/ if you want to publish the retrieval-optimized demo corpus.
+structured_markdown/
+
+# Local reference materials not intended for GitHub
+其他/

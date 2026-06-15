@@ -35,7 +35,9 @@ ENV PATH="/home/cloudrag/.local/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
-    PORT=8080
+    PORT=8080 \
+    POSTGRES_HOST=postgres \
+    UPLOAD_DIR=/app/uploads
 
 USER cloudrag
 

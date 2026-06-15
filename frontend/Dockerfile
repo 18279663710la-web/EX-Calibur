@@ -13,7 +13,7 @@ WORKDIR /app
 # 使用淘宝 npm 镜像加速
 RUN npm config set registry https://registry.npmmirror.com
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm ci
+RUN npm ci
 
 # 源码
 COPY svelte.config.js vite.config.ts tsconfig.json tsconfig.node.json ./

@@ -28,6 +28,33 @@ export type StateListener = (state: StreamingState) => void;
 
 const BASE_URL = '/api/v1';
 
+export interface ParsedSSEEvent {
+  event: string;
+  data: Record<string, unknown>;
+}
+
+export function parseSSEBlock(block: string): ParsedSSEEvent | null {
+  let event = 'message';
+  const dataLines: string[] = [];
+
+  for (const rawLine of block.split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+
+  if (dataLines.length === 0) return null;
+  try {
+    return { event, data: JSON.parse(dataLines.join('\n')) as Record<string, unknown> };
+  } catch {
+    return null;
+  }
+}
+
 export function createChatStream(
   request: ChatRequest,
   onStateChange: StateListener,
@@ -90,28 +117,26 @@ export function createChatStream(
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        // Keep incomplete last line in buffer
-        buffer = lines.pop() || '';
+        const blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop() || '';
 
-        let currentEvent = '';
-        for (const line of lines) {
-          if (line.startsWith('event: ')) {
-            currentEvent = line.slice(7).trim();
-          } else if (line.startsWith('data: ')) {
-            const dataStr = line.slice(6);
-            try {
-              const data = JSON.parse(dataStr);
-              handleSSEEvent(currentEvent, data, state, onStateChange);
-            } catch {
-              // Skip malformed JSON
-            }
-            currentEvent = '';
+        for (const block of blocks) {
+          const parsed = parseSSEBlock(block);
+          if (parsed) {
+            handleSSEEvent(parsed.event, parsed.data, state, onStateChange);
           }
         }
+      }
+
+      const parsed = parseSSEBlock(buffer);
+      if (parsed) {
+        handleSSEEvent(parsed.event, parsed.data, state, onStateChange);
       }
     })
     .catch((err) => {

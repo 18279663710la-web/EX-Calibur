@@ -1,31 +1,39 @@
-/**
- * TDD Test: 验证 ChatView 的 useMock 逻辑
- *
- * 当前 Bug: ChatView.svelte line 125 写死了 || true，强制用 Mock
- * 期望行为: 后端健康时不走 Mock，只有后端不可达时才 fallback
- */
-import { describe, it, expect, vi } from 'vitest';
-import { createChatStream, createMockChatStream } from '../src/lib/sse';
+import { describe, expect, it } from 'vitest';
+import { parseSSEBlock } from './sse';
 
-describe('ChatView SSE mode detection', () => {
-  it('should use real API when backend is healthy', async () => {
-    // Given: backend is reachable (health endpoint returns 200)
-    const canReachBackend = async (): Promise<boolean> => {
-      try {
-        const res = await fetch('/health');
-        return res.ok;
-      } catch {
-        return false;
+describe('SSE parser', () => {
+  it('parses named SSE event blocks', () => {
+    const parsed = parseSSEBlock('event: message\ndata: {"token":"你好","index":0}');
+
+    expect(parsed).toEqual({
+      event: 'message',
+      data: { token: '你好', index: 0 },
+    });
+  });
+
+  it('keeps event and data together when chunks are reassembled by blank lines', () => {
+    let buffer = '';
+    const chunks = [
+      'event: message\n',
+      'data: {"token":"你","index":0}\n\n',
+      'event: done\n',
+      'data: {"conversation_id":"c1"}\n\n',
+    ];
+    const events = [];
+
+    for (const chunk of chunks) {
+      buffer += chunk;
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() || '';
+      for (const block of blocks) {
+        const parsed = parseSSEBlock(block);
+        if (parsed) events.push(parsed);
       }
-    };
-
-    // When: deciding whether to use mock
-    const useMock = !(await canReachBackend());
-
-    // Then: if backend is healthy, should NOT use mock
-    // This test FAILS with current code because `|| true` forces mock
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      expect(useMock).toBe(false);
     }
+
+    expect(events).toEqual([
+      { event: 'message', data: { token: '你', index: 0 } },
+      { event: 'done', data: { conversation_id: 'c1' } },
+    ]);
   });
 });
