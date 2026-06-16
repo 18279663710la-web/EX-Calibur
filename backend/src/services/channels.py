@@ -18,6 +18,8 @@ import httpx
 import qrcode
 
 from ..config import get_settings
+from .file_matcher import resolve_best_match, search_knowledge_files
+from .file_matcher import normalize_query, resolve_best_match, search_knowledge_files
 
 
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -30,6 +32,19 @@ CLIENT_VERSION = "131072"
 QR_MAX_REFRESHES = 10
 MAX_RECENT_WEIXIN_MESSAGES = 1024
 UPLOAD_MAX_RETRIES = 3
+OPEN_FILE_INTENTS = (
+    "打开",
+    "查看",
+    "预览",
+    "发送",
+    "回传",
+    "给我",
+    "发我",
+    "传给我",
+    "完整",
+    "文档",
+    "文件",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +341,7 @@ class ChannelManager:
         self.knowledge_dir = Path(knowledge_dir or os.getenv("AGENT_KNOWLEDGE_DIR", "knowledge")).resolve()
         self._seen_message_ids: dict[str, str] = {}
         self._weixin_context_tokens: dict[str, str] = {}
+        self._weixin_file_choices: dict[str, list[str]] = {}
         self._weixin_updates_cursor = ""
         self._weixin_poll_task: asyncio.Task | None = None
         self._weixin_stop_event = asyncio.Event()
@@ -575,21 +591,7 @@ class ChannelManager:
         }
 
     def resolve_knowledge_file(self, filename: str) -> Path | None:
-        requested = Path(str(filename or "").replace("\\", "/")).name
-        if not requested:
-            return None
-        if not self.knowledge_dir.exists():
-            return None
-
-        files = [path for path in self.knowledge_dir.rglob("*") if path.is_file()]
-        for path in files:
-            if path.name == requested:
-                return path
-        requested_lower = requested.lower()
-        for path in files:
-            if path.name.lower() == requested_lower:
-                return path
-        return None
+        return resolve_best_match(filename, knowledge_dir=self.knowledge_dir)
 
     async def send_weixin_text_reply(
         self,
@@ -678,7 +680,7 @@ class ChannelManager:
 
         if file_name and (file_bytes_b64 or item_type == 4):
             event_type = "file"
-        elif file_name or _looks_like_open_file(content):
+        elif file_name or self.resolve_file_choice(user_id, content) or _looks_like_open_file(content):
             event_type = "open_file"
         else:
             event_type = "text"
@@ -851,6 +853,31 @@ class ChannelManager:
         if not channel:
             raise KeyError(name)
         return channel
+
+    def remember_file_choices(self, user_id: str, filenames: list[str]):
+        cleaned = [Path(str(name or "")).name for name in filenames if str(name or "").strip()]
+        if cleaned:
+            self._weixin_file_choices[user_id] = cleaned[:10]
+        else:
+            self.clear_file_choices(user_id)
+
+    def clear_file_choices(self, user_id: str):
+        self._weixin_file_choices.pop(user_id, None)
+
+    def resolve_file_choice(self, user_id: str, content: str) -> str | None:
+        text = str(content or "").strip()
+        if not text.isdigit():
+            return None
+        index = int(text)
+        if index < 1:
+            return None
+        choices = self._weixin_file_choices.get(user_id) or []
+        if index > len(choices):
+            return None
+        return choices[index - 1]
+
+    def find_knowledge_file_matches(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+        return search_knowledge_files(query, knowledge_dir=self.knowledge_dir, top_k=limit)
 
 
 def _now() -> str:
@@ -1073,9 +1100,7 @@ def download_media_from_cdn(
 
 
 def extract_open_filename(content: str) -> str:
-    text = str(content or "").strip()
-    text = re.sub(r"^(打开|查看|预览|发送|回传)\s*", "", text)
-    return text.strip()
+    return normalize_query(content)
 
 
 def _normalize_delivery_result(result: Any, *, to_user: str) -> dict[str, Any]:
@@ -1109,9 +1134,73 @@ def _text_from_item(item: dict[str, Any]) -> str:
 
 def _looks_like_open_file(content: str) -> bool:
     text = str(content or "").strip()
-    return bool(
-        re.match(r"^(打开|查看|预览|发送|回传|鎵撳紑|鏌ョ湅|棰勮|鍙戦€亅鍥炰紶)\s+", text)
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(token in text for token in OPEN_FILE_INTENTS) or any(
+        token in lowered for token in ("open", "view", "preview", "send", "file", "document")
     )
+
+
+def _normalize_file_query(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return ""
+    for prefix in ("打开", "查看", "预览", "发送", "回传"):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    for token in (
+        "请",
+        "帮我",
+        "把",
+        "完整的",
+        "完整",
+        "文档",
+        "文件",
+        "给我",
+        "发我",
+        "传给我",
+        "打开",
+        "查看",
+        "预览",
+        "发送",
+        "回传",
+        "一下",
+        "这个",
+        "那个",
+    ):
+        text = text.replace(token, " ")
+    punctuation_chars = "\"'`,.:;!?()[]{}<>"
+    for ch in punctuation_chars:
+        text = text.replace(ch, ' ')
+    text = ' '.join(text.split())
+    return text
+
+
+def _file_match_score(query: str, file_name: str) -> float:
+    normalized_query = _compact_for_match(_normalize_file_query(query))
+    normalized_name = _compact_for_match(file_name)
+    normalized_stem = _compact_for_match(Path(file_name).stem)
+    if not normalized_query:
+        return 0
+    if normalized_query == normalized_name or normalized_query == normalized_stem:
+        return 100
+    if normalized_name.startswith(normalized_query) or normalized_stem.startswith(normalized_query):
+        return 95
+    if normalized_query in normalized_name or normalized_query in normalized_stem:
+        return 90
+    query_parts = [part for part in re.split(r"[^0-9a-zA-Z一-鿿]+", normalized_query) if part]
+    if not query_parts:
+        return 0
+    hits = sum(1 for part in query_parts if part in normalized_name or part in normalized_stem)
+    if hits:
+        return max(50, hits / len(query_parts) * 80)
+    return 0
+
+
+def _compact_for_match(value: str) -> str:
+    return ''.join(ch for ch in str(value or '').lower() if ch.isdigit() or ('a' <= ch <= 'z') or ('一' <= ch <= '鿿'))
 
 
 _channel_manager: ChannelManager | None = None

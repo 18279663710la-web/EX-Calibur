@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import List
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
-from rapidfuzz import fuzz
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+BACKEND_ROOT = PROJECT_ROOT / "backend"
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from src.services.file_matcher import resolve_best_match, search_knowledge_files
+
 DEFAULT_KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge"
 
 
@@ -56,46 +61,23 @@ def resolve_file(filename: str) -> Path | None:
     requested = _requested_basename(filename)
     if not requested:
         return None
-
-    files = _iter_knowledge_files()
-    for path in files:
-        if path.name == requested:
-            return path
-
-    requested_lower = requested.lower()
-    for path in files:
-        if path.name.lower() == requested_lower:
-            return path
-
-    matches = [
-        (fuzz.partial_ratio(requested_lower, path.name.lower()), path)
-        for path in files
-    ]
-    if not matches:
-        return None
-    score, path = max(matches, key=lambda item: item[0])
-    return path if score >= 85 else None
+    return resolve_best_match(requested, knowledge_dir=ensure_knowledge_dir())
 
 
 def search_files(keyword: str, top_k: int = 5) -> list[dict[str, object]]:
-    knowledge_dir = ensure_knowledge_dir()
-    results: list[dict[str, object]] = []
-
-    for root, _, files in os.walk(knowledge_dir):
-        for filename in files:
-            score = fuzz.partial_ratio(keyword.lower(), filename.lower())
-            if score > 30:
-                path = Path(root) / filename
-                results.append(
-                    {
-                        "filename": filename,
-                        "path": str(path),
-                        "score": score,
-                    }
-                )
-
-    results.sort(key=lambda item: item["score"], reverse=True)
-    return results[:top_k]
+    matches = search_knowledge_files(
+        keyword,
+        knowledge_dir=ensure_knowledge_dir(),
+        top_k=top_k,
+    )
+    return [
+        {
+            "filename": item["file_name"],
+            "path": item["path"],
+            "score": item["score"],
+        }
+        for item in matches
+    ]
 
 
 @app.get("/health")

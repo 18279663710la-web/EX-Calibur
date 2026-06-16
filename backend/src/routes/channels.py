@@ -93,7 +93,15 @@ async def handle_weixin_event(
     *,
     manager: ChannelManager,
 ):
+    selected_file = manager.resolve_file_choice(body.user_id, body.content)
+    if body.event_type == "open_file" or selected_file:
+        return await _deliver_weixin_file_request(body, manager=manager, selected_file=selected_file)
+
     if body.event_type == "text":
+        matches = manager.find_knowledge_file_matches(body.content)
+        if matches:
+            return await _send_weixin_file_choices(body, manager=manager, matches=matches)
+
         dify_result = await _run_dify_text(body.user_id, body.content)
         answer = dify_result["answer"] or "已收到消息，但 Dify 未返回可发送内容。"
         delivery = await manager.send_weixin_text_reply(
@@ -138,12 +146,36 @@ async def handle_weixin_event(
             }
         )
 
-    filename = body.file_name or _extract_open_filename(body.content)
+    return await _deliver_weixin_file_request(body, manager=manager)
+
+
+async def _deliver_weixin_file_request(
+    body: WeixinWebhookRequest,
+    *,
+    manager: ChannelManager,
+    selected_file: str | None = None,
+):
+    filename = selected_file or body.file_name or _extract_open_filename(body.content)
     if not filename:
+        matches = manager.find_knowledge_file_matches(body.content)
+        if matches:
+            return await _send_weixin_file_choices(body, manager=manager, matches=matches)
         return Envelope.error(40001, "file_name or open-file content is required")
+
+    if not selected_file:
+        candidate_matches = manager.find_knowledge_file_matches(filename)
+        if len(candidate_matches) > 1:
+            return await _send_weixin_file_choices(body, manager=manager, matches=candidate_matches)
+        if len(candidate_matches) == 1:
+            filename = candidate_matches[0]["file_name"]
+
+    manager.clear_file_choices(body.user_id)
     try:
         send_file = manager.build_send_file_payload(to_user=body.user_id, filename=filename)
     except FileNotFoundError:
+        matches = manager.find_knowledge_file_matches(filename)
+        if matches:
+            return await _send_weixin_file_choices(body, manager=manager, matches=matches)
         return Envelope.error(40401, "文件不存在")
     delivery = await manager.send_weixin_file_reply(
         to_user=body.user_id,
@@ -162,10 +194,58 @@ async def handle_weixin_event(
     )
 
 
+async def _send_weixin_file_choices(
+    body: WeixinWebhookRequest,
+    *,
+    manager: ChannelManager,
+    matches: list[dict[str, Any]],
+):
+    manager.remember_file_choices(body.user_id, [item["file_name"] for item in matches])
+    content = _format_file_choices(body.content, matches)
+    delivery = await manager.send_weixin_text_reply(
+        to_user=body.user_id,
+        content=content,
+        context_token=body.context_token,
+    )
+    return Envelope.success(
+        data={
+            "status": "delivered",
+            "channel": "weixin",
+            "reply_type": "open_file_choices",
+            "message": {
+                "to_user": body.user_id,
+                "content": content,
+            },
+            "choices": matches,
+            "delivery": delivery,
+        }
+    )
+
+
 def _extract_open_filename(content: str) -> str:
     text = extract_open_filename(content)
     text = re.sub(r"^(打开|查看|预览|发送|回传)\s*", "", text)
     return text.strip()
+
+
+def _looks_like_open_file_request(content: str) -> bool:
+    return False
+
+
+def _format_file_choices(content: str, matches: list[dict[str, Any]]) -> str:
+    lines = [
+        f"根据搜索关键词 “{content}”，找到以下 {len(matches)} 个匹配文件（按匹配度从高到低排序）：",
+        "",
+    ]
+    for index, item in enumerate(matches, start=1):
+        score = item.get("score")
+        if isinstance(score, (int, float)):
+            score_text = f"{score:.0f}%"
+        else:
+            score_text = str(score or "未知")
+        lines.append(f"{index}. {item.get('file_name')}（匹配度：{score_text}）")
+    lines.extend(["", "请问您想打开哪一个？请回复序号（如“1”）或完整文件名。"])
+    return "\n".join(lines)
 
 
 async def _legacy_weixin_webhook(
