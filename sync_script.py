@@ -21,6 +21,11 @@ from typing import Any, Protocol
 
 import requests
 from docx import Document
+from docx.document import Document as DocxDocument
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from PyPDF2 import PdfReader
 
 
@@ -97,6 +102,10 @@ class UploadCandidate:
     generated_relative_path: str | None = None
 
 
+def dataset_documents_url(base_url: str, dataset_id: str) -> str:
+    return f"{normalize_base_url(base_url)}/datasets/{dataset_id}/documents"
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -111,15 +120,17 @@ def upload_url(base_url: str, dataset_id: str) -> str:
 
 def load_ledger(ledger_path: Path) -> dict[str, Any]:
     if not ledger_path.exists():
-        return {"files": {}}
+        return {"files": {}, "whitelist": {}}
 
     with ledger_path.open("r", encoding="utf-8") as file:
         data = json.load(file)
 
     if not isinstance(data, dict):
-        return {"files": {}}
+        return {"files": {}, "whitelist": {}}
     if not isinstance(data.get("files"), dict):
         data["files"] = {}
+    if not isinstance(data.get("whitelist"), dict):
+        data["whitelist"] = {}
     return data
 
 
@@ -172,15 +183,131 @@ def needs_upload(file_state: FileState, ledger: dict[str, Any], *, pipeline: str
     record = ledger.get("files", {}).get(file_state.relative_path)
     if not isinstance(record, dict):
         return True
+    if record.get("status") != "synced":
+        return True
     if record.get("pipeline", "direct") != pipeline:
         return True
     if pipeline == "deepseek" and record.get("pipeline_version") != PIPELINE_VERSION:
         return True
+    if not record.get("document_id"):
+        return True
     return not (
-        record.get("status") == "synced"
-        and record.get("sha256") == file_state.sha256
+        record.get("sha256") == file_state.sha256
         and record.get("size") == file_state.size
     )
+
+
+def expected_remote_name(relative_path: str, pipeline: str) -> str:
+    path = Path(relative_path)
+    if pipeline == "deepseek":
+        return path.with_suffix(".md").name
+    return path.name
+
+
+def build_remote_documents_by_name(remote_documents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    documents_by_name: dict[str, dict[str, Any]] = {}
+    for document in remote_documents:
+        if not isinstance(document, dict):
+            continue
+        document_id = document.get("id")
+        name = document.get("name") or document.get("data_source_info", {}).get("upload_file", {}).get("name")
+        if not isinstance(document_id, str) or not isinstance(name, str) or not name:
+            continue
+        documents_by_name[name] = {
+            "document_id": document_id,
+            "remote_name": name,
+            "indexing_status": document.get("indexing_status"),
+        }
+    return documents_by_name
+
+
+def list_dataset_documents(
+    *,
+    base_url: str,
+    dataset_api_key: str,
+    dataset_id: str,
+    session: requests.Session,
+) -> list[dict[str, Any]]:
+    headers = {"Authorization": f"Bearer {dataset_api_key}"}
+    page = 1
+    documents: list[dict[str, Any]] = []
+    while True:
+        response = session.get(
+            dataset_documents_url(base_url, dataset_id),
+            headers=headers,
+            params={"page": page, "limit": 100},
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            raise requests.HTTPError(
+                f"{response.status_code} {response.reason}: {response.text[:1000]}",
+                response=response,
+            )
+        payload = response.json()
+        batch = payload.get("data")
+        if not isinstance(batch, list) or not batch:
+            break
+        documents.extend(item for item in batch if isinstance(item, dict))
+        if len(batch) < 100:
+            break
+        page += 1
+    return documents
+
+
+def refresh_ledger_whitelist(
+    ledger: dict[str, Any],
+    files: list[FileState],
+    remote_documents: list[dict[str, Any]],
+    *,
+    pipeline: str,
+) -> None:
+    remote_by_name = build_remote_documents_by_name(remote_documents)
+    remote_name_counts: dict[str, int] = {}
+    for file_state in files:
+        remote_name = expected_remote_name(file_state.relative_path, pipeline)
+        remote_name_counts[remote_name] = remote_name_counts.get(remote_name, 0) + 1
+
+    whitelist: dict[str, dict[str, Any]] = {}
+    ledger["whitelist"] = whitelist
+    known_files = {file_state.relative_path for file_state in files}
+    file_records = ledger.setdefault("files", {})
+
+    for file_state in files:
+        record = file_records.get(file_state.relative_path, {})
+        if not isinstance(record, dict):
+            record = {}
+        remote_name = expected_remote_name(file_state.relative_path, pipeline)
+        whitelist_entry = (
+            remote_by_name.get(remote_name)
+            if remote_name_counts.get(remote_name, 0) == 1
+            else None
+        )
+        if whitelist_entry:
+            whitelist[file_state.relative_path] = whitelist_entry
+            record.update(
+                {
+                    "status": "synced",
+                    "sha256": file_state.sha256,
+                    "size": file_state.size,
+                    "modified_at": file_state.modified_at,
+                    "document_id": whitelist_entry["document_id"],
+                    "remote_name": whitelist_entry["remote_name"],
+                    "indexing_status": whitelist_entry.get("indexing_status"),
+                    "pipeline": pipeline,
+                }
+            )
+            if pipeline == "deepseek":
+                record["pipeline_version"] = PIPELINE_VERSION
+        elif record.get("document_id"):
+            record.pop("document_id", None)
+            record.pop("remote_name", None)
+            record.pop("indexing_status", None)
+            record["status"] = "pending"
+        file_records[file_state.relative_path] = record
+
+    stale_keys = [key for key in file_records.keys() if key not in known_files]
+    for key in stale_keys:
+        file_records.pop(key, None)
 
 
 def dify_document_payload() -> dict[str, Any]:
@@ -286,10 +413,45 @@ def preserved_source_markdown(raw_text: str, file_name: str) -> str:
     """Convert extracted source text to Markdown while preserving every line."""
 
     lines = [line.rstrip() for line in raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
-    body = "\n".join(lines).strip()
+    body_lines: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped:
+            if body_lines and body_lines[-1] != "":
+                body_lines.append("")
+            index += 1
+            continue
+
+        if "\t" in line:
+            table_rows: list[list[str]] = []
+            expected_cols = len(line.split("\t"))
+            cursor = index
+            while cursor < len(lines):
+                candidate = lines[cursor]
+                if not candidate.strip() or "\t" not in candidate:
+                    break
+                cells = [cell.strip() for cell in candidate.split("\t")]
+                if len(cells) != expected_cols:
+                    break
+                table_rows.append(cells)
+                cursor += 1
+            if len(table_rows) >= 2 and expected_cols >= 2:
+                body_lines.append("| " + " | ".join(table_rows[0]) + " |")
+                body_lines.append("| " + " | ".join(["---"] * expected_cols) + " |")
+                for row in table_rows[1:]:
+                    body_lines.append("| " + " | ".join(row) + " |")
+                index = cursor
+                continue
+
+        body_lines.append(line)
+        index += 1
+
+    body = "\n".join(body_lines).strip()
     if not body:
         return f"## {Path(file_name).stem}\n"
-    if any(line.lstrip().startswith("#") for line in lines):
+    if any(line.lstrip().startswith("#") for line in body_lines):
         return body + "\n"
     return f"## {Path(file_name).stem}\n\n{body}\n"
 
@@ -361,10 +523,34 @@ def guess_mime_type(path: Path) -> str:
     return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
 
+def iter_docx_blocks(document: DocxDocument):
+    for child in document.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, document)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, document)
+
+
+def extract_docx_table_lines(table: Table) -> list[str]:
+    lines: list[str] = []
+    for row in table.rows:
+        cells = [cell.text.strip() for cell in row.cells]
+        if any(cells):
+            lines.append("\t".join(cells))
+    return lines
+
+
 def extract_docx_text(path: Path) -> str:
     document = Document(path)
-    lines = [paragraph.text.strip() for paragraph in document.paragraphs]
-    return "\n".join(line for line in lines if line)
+    lines: list[str] = []
+    for block in iter_docx_blocks(document):
+        if isinstance(block, Paragraph):
+            text = block.text.strip()
+            if text:
+                lines.append(text)
+            continue
+        lines.extend(extract_docx_table_lines(block))
+    return "\n".join(lines)
 
 
 def extract_pdf_text(path: Path) -> str:
@@ -674,12 +860,11 @@ def run_sync(
 ) -> SyncResult:
     files = iter_supported_files(source_dir)
     ledger = load_ledger(ledger_path)
-    pending = [
-        file_state for file_state in files if needs_upload(file_state, ledger, pipeline=pipeline)
-    ]
-    skipped = len(files) - len(pending)
-
     if dry_run:
+        pending = [
+            file_state for file_state in files if needs_upload(file_state, ledger, pipeline=pipeline)
+        ]
+        skipped = len(files) - len(pending)
         for file_state in pending:
             print(f"[DRY-RUN] would upload: {file_state.relative_path}")
         print(
@@ -707,6 +892,18 @@ def run_sync(
         )
 
     active_session = session or requests.Session()
+    remote_documents = list_dataset_documents(
+        base_url=base_url,
+        dataset_api_key=dataset_api_key,
+        dataset_id=dataset_id,
+        session=active_session,
+    )
+    refresh_ledger_whitelist(ledger, files, remote_documents, pipeline=pipeline)
+    save_ledger(ledger_path, ledger)
+    pending = [
+        file_state for file_state in files if needs_upload(file_state, ledger, pipeline=pipeline)
+    ]
+    skipped = len(files) - len(pending)
     candidates = build_upload_candidates(
         pending,
         pipeline=pipeline,

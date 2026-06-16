@@ -111,7 +111,7 @@ services:
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
     volumes:
       - ./knowledge:/app/knowledge:ro
-      - sync_ledger_data:/app/state
+      - ./sync_ledger.json:/app/state/sync_ledger.json
       - structured_markdown_data:/app/structured_markdown
     extra_hosts:
       - "host.docker.internal:host-gateway"
