@@ -58,3 +58,5 @@ structured_markdown/
 # Local reference materials not intended for GitHub
 其他/
 knowledge/claude配置文件.txt
+knowledge/*
+!knowledge/.gitkeep
