@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -19,6 +20,30 @@ from ..models.chat import (
 )
 
 logger = logging.getLogger(__name__)
+
+_REFERENCE_DISPLAY_LIMIT = 5
+_REFERENCE_MIN_VISIBLE_SCORE = 0.08
+_REFERENCE_STOP_TERMS = {
+    "一下",
+    "中的",
+    "里面",
+    "文件",
+    "文档",
+    "知识",
+    "识库",
+    "请问",
+    "帮我",
+    "这个",
+    "那个",
+    "现在",
+    "部分",
+    "怎么",
+    "怎样",
+    "如何",
+    "什么",
+    "应该",
+    "可以",
+}
 
 
 def _sse_line(event: str, data: dict) -> str:
@@ -230,6 +255,136 @@ def _references_from_node(data: dict[str, Any]) -> list[dict[str, Any]]:
     return chunks
 
 
+def _normalize_reference_text(value: Any) -> str:
+    text = str(value or "").lower()
+    return "".join(char for char in text if char.isalnum() or char == "%")
+
+
+def _document_stem(file_name: str) -> str:
+    stem = str(file_name or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return re.sub(r"\.[a-z0-9]+$", "", stem, flags=re.IGNORECASE)
+
+
+def _query_terms(query: str) -> set[str]:
+    normalized = _normalize_reference_text(query)
+    terms: set[str] = set()
+    for match in re.finditer(r"[\u4e00-\u9fff]+|[a-z0-9_+#.-]+", normalized):
+        token = match.group(0)
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            if len(token) == 1:
+                continue
+            for size in range(2, 9):
+                if len(token) < size:
+                    continue
+                for start in range(0, len(token) - size + 1):
+                    term = token[start : start + size]
+                    if term not in _REFERENCE_STOP_TERMS:
+                        terms.add(term)
+        elif len(token) >= 2 and token not in _REFERENCE_STOP_TERMS:
+            terms.add(token)
+    return terms
+
+
+def _safe_score(value: Any) -> float:
+    try:
+        score = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if score > 1:
+        score = score / 100
+    return max(0.0, min(score, 1.0))
+
+
+def _reference_relevance_score(query: str, chunk: dict[str, Any]) -> float:
+    query_norm = _normalize_reference_text(query)
+    file_stem = _document_stem(str(chunk.get("file_name") or ""))
+    file_norm = _normalize_reference_text(file_stem)
+    content_norm = _normalize_reference_text(chunk.get("content"))
+    terms = _query_terms(query)
+
+    score = 0.0
+    if file_norm and file_norm in query_norm:
+        score += 0.65
+    if file_norm and file_norm in content_norm:
+        score += 0.2
+
+    if terms:
+        haystack = f"{file_norm}{content_norm}"
+        matched = sum(1 for term in terms if term in haystack)
+        score += min(0.35, matched / max(1, min(len(terms), 8)) * 0.35)
+
+    return max(0.0, min(score, 1.0))
+
+
+def _content_term_score(query: str, chunk: dict[str, Any]) -> float:
+    terms = _query_terms(query)
+    if not terms:
+        return 0.0
+    content_norm = _normalize_reference_text(chunk.get("content"))
+    total_weight = sum(len(term) for term in terms)
+    matched_weight = sum(len(term) for term in terms if term in content_norm)
+    score = matched_weight / max(1, total_weight)
+    if any(term in query for term in ("关键数据", "数据", "指标", "概率", "精度")):
+        if re.search(r"\d+(?:\.\d+)?\s*%", str(chunk.get("content") or "")):
+            score += 0.2
+    return min(score, 1.0)
+
+
+def _filter_visible_references(
+    query: str,
+    chunks: list[dict[str, Any]],
+    *,
+    max_visible: int = _REFERENCE_DISPLAY_LIMIT,
+) -> list[dict[str, Any]]:
+    query_norm = _normalize_reference_text(query)
+    named_document_chunks = [
+        chunk
+        for chunk in chunks
+        if (stem := _normalize_reference_text(_document_stem(str(chunk.get("file_name") or ""))))
+        and stem in query_norm
+    ]
+    candidates = named_document_chunks or chunks
+
+    visible = []
+    seen: set[tuple[str, str]] = set()
+    for chunk in candidates:
+        relevance = _reference_relevance_score(query, chunk)
+        original_score = _safe_score(chunk.get("score"))
+        display_score = max(original_score, relevance)
+        if not named_document_chunks and display_score < _REFERENCE_MIN_VISIBLE_SCORE:
+            continue
+        if named_document_chunks and display_score <= 0:
+            continue
+
+        key = (
+            str(chunk.get("file_name") or ""),
+            str(chunk.get("content") or "")[:160],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+
+        visible.append(
+            {
+                **chunk,
+                "score": display_score,
+                "_content_term_score": _content_term_score(query, chunk),
+            }
+        )
+
+    visible.sort(
+        key=lambda item: (
+            _content_term_score(query, item),
+            _safe_score(item.get("score")),
+        ),
+        reverse=True,
+    )
+    return [
+        {key: value for key, value in {**chunk, "index": index}.items() if key != "_content_term_score"}
+        for index, chunk in enumerate(visible[:max_visible])
+    ]
+
+
 async def chat_stream(
     user_id: str,
     username: str,
@@ -324,6 +479,8 @@ async def chat_stream(
 
                         if event_type == "node_finished":
                             chunks = _references_from_node(data)
+                            if chunks:
+                                chunks = _filter_visible_references(request.query, chunks)
                             if chunks:
                                 yield _sse_line(
                                     "references",

@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     dify_base_url: str = "https://api.dify.ai/v1"
     dify_api_key: str = ""
     dify_dataset_api_key: str = ""
-    dify_dataset_id: str = "45725dcd-82f3-45b9-8116-ce9ac9fac096"
+    dify_dataset_id: str = ""
     dify_internal_key: str = ""
     dify_timeout_seconds: int = 120
 

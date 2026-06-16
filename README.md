@@ -1,68 +1,77 @@
-# Excalibur
+# Excalibur / CloudRAG-Hub
 
-Excalibur是一个个人文件检索助手，以Dify Chatflow为底座，在web页面中能进行文件上传、打开、以及RAG检索文件内容操作，移动端以微信作为交互通道。
-<img width="2527" height="1330" alt="image" src="https://github.com/user-attachments/assets/78036e7c-cc7b-4253-887e-69e3465d6231" />
+Excalibur 是一个基于 Dify Chatflow 的个人文件检索助手。Web 端提供文件上传、打开文件、RAG 问答和通道管理；移动端通过微信通道交互。CloudRAG 后端只作为网关层：接收 Web 或微信消息，转发到 Dify 或本地文件库，再把结果回传给对应通道。RAG 检索、知识库问答、文件清洗与索引质量由 Dify 工作流和同步脚本负责。
 
-## 主要功能
+<img width="2527" height="1330" alt="CloudRAG Web" src="https://github.com/user-attachments/assets/78036e7c-cc7b-4253-887e-69e3465d6231" />
 
-- 通过 Dify App API 转发文本对话和文件对话。
-- 支持流式响应、会话记录、Token 与延迟统计。
-- 支持微信 / Clawbot 通道管理。
-- 支持本地文件库服务 `agent_server.py`，用于文件搜索、上传和本地文件入口。
-- 支持将本地 Markdown、Word、PDF 等文档同步到 Dify 知识库。
-- 使用 PostgreSQL 保存 CloudRAG 本地账号、文件、会话、消息和审计日志。
+## 功能概览
+
+- CloudRAG-Hub Web 页面：文本问答、文件上传、文件打开/预览、通道管理。
+- 微信通道：接入 ClawBot/iLink 后主动轮询微信消息。
+- 文本消息：转发到 Dify Chatflow，并把答案发回原用户。
+- 文件消息：写入 `knowledge/` 文件库，并发送上传确认。
+- 打开/查看文件：Web 端返回可预览信息；微信端直接通过 send-file 回传文件本体。
+- 文件库同步：定时扫描 `knowledge/`，清洗成 Markdown，并上传到 Dify Dataset。
 
 ## 项目结构
 
 ```text
 .
-├── backend/                         # FastAPI 后端网关
-├── frontend/                        # Svelte + Vite 前端，Docker 中由 Nginx 托管
-├── tests/                           # 后端、Dify 调用和同步脚本测试
-├── knowledge/                       # 本地文件库示例目录，会挂载给 agent-server
-├── structured_markdown_retrieval/   # 适合导入 Dify 知识库的检索增强 Markdown
-├── EX咖喱棒.yml                     # 从 Dify 导出的 Chatflow DSL
-├── agent_server.py                  # 本地文件库 Agent 服务
-├── sync_script.py                   # 本地文档同步到 Dify 知识库的可选脚本
-├── docker-compose.yml               # 一键启动配置
-└── .env.example                     # 环境变量模板，不包含真实密钥
+├── backend/                       # FastAPI 网关服务
+├── frontend/                      # Svelte + Vite 前端，Docker 中由 Nginx 托管
+├── knowledge/                     # 本地文件库，Web/微信上传文件会落到这里
+├── structured_markdown_retrieval/ # 可选的检索优化 Markdown 示例语料
+├── EX咖喱棒.yml                   # Dify Chatflow DSL
+├── agent_server.py                # 可选的本地文件库 HTTP 服务
+├── sync_script.py                 # 文件库到 Dify Dataset 的同步脚本
+├── knowledge-sync.Dockerfile      # 同步脚本容器镜像
+├── docker-compose.yml             # 一键启动配置
+└── .env.example                   # 环境变量模板
 ```
+
 Dify Chatflow：
 
-<img width="2112" height="1224" alt="EX咖喱棒 (1)" src="https://github.com/user-attachments/assets/1bdff0ad-d202-41f1-8761-54f052ed31a9" />
+<img width="2112" height="1224" alt="Dify Chatflow" src="https://github.com/user-attachments/assets/1bdff0ad-d202-41f1-8761-54f052ed31a9" />
 
+`tests/`、`reports/`、`.pytest_cache/`、`.env`、运行时上传目录和同步账本不提交到 GitHub。
 
-## 环境要求
+## 运行前准备
 
-- Docker 和 Docker Compose。
-- 一个可用的 Dify 实例，可以是本地 Docker 部署，也可以是 Dify Cloud。
-- 如果本地开发前端，需要 Node.js 22+。
-- 如果本地开发后端或运行同步脚本，需要 Python 3.12+。
+需要先准备：
 
-## 环境变量
+- Docker 与 Docker Compose。
+- 一个可用的 Dify 实例，可以是本地 Dify Docker，也可以是 Dify Cloud。
+- 已导入并发布的 Dify Chatflow。
+- 如需微信通道，准备可用的 ClawBot/iLink 登录态和 Token。
 
-复制模板：
-
-```bash
-cp .env.example .env
-```
-
-Windows PowerShell：
+复制环境变量模板：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-至少需要配置：
+Linux/macOS：
 
-- `JWT_SECRET_KEY`：CloudRAG 本地登录用 JWT 密钥。
-- `POSTGRES_PASSWORD`：CloudRAG 本地 PostgreSQL 密码。
-- `DIFY_BASE_URL`：Dify API 地址。
-- `DIFY_API_KEY`：Dify 应用发布后的 App API Key。
-- `FRONTEND_PORT`：前端访问端口，默认 `8081`。
-- `AGENT_PORT`：文件库 Agent 服务端口，默认 `8090`。
+```bash
+cp .env.example .env
+```
 
-如果 Dify 是本机 Docker 部署，并且通过 `http://localhost` 暴露，推荐：
+至少修改这些变量：
+
+```env
+JWT_SECRET_KEY=change-me-to-a-random-64-character-secret
+POSTGRES_PASSWORD=change-me
+DIFY_BASE_URL=http://api:5001/v1
+DIFY_API_KEY=your-dify-app-api-key
+```
+
+如果 Dify 是本机 Docker 部署，并且 CloudRAG 加入了 Dify 的 `docker_default` 网络，推荐：
+
+```env
+DIFY_BASE_URL=http://api:5001/v1
+```
+
+如果 CloudRAG 容器需要访问宿主机上的 Dify：
 
 ```env
 DIFY_BASE_URL=http://host.docker.internal/v1
@@ -74,22 +83,20 @@ DIFY_BASE_URL=http://host.docker.internal/v1
 DIFY_BASE_URL=https://api.dify.ai/v1
 ```
 
-不要提交 `.env` 文件。该文件已经被 `.gitignore` 忽略。
+不要提交 `.env`，里面会包含真实密钥。
 
-## 在 Dify 中导入当前工作流
+## 导入 Dify 工作流
 
 1. 打开 Dify 控制台。
-2. 进入目标 Workspace。
-3. 选择“导入 DSL / 导入应用”。
-4. 选择仓库根目录下的 `EX咖喱棒.yml`。
-5. 如果 Dify 提示缺少模型插件，请安装工作流依赖的模型插件。
-6. 配置对应模型供应商凭据。
-7. 创建或选择知识库。
-8. 打开导入后的工作流，将知识检索节点绑定到自己的知识库。
-9. 发布应用。
-10. 复制 Dify 生成的 App API Key，填入 `.env` 的 `DIFY_API_KEY`。
+2. 选择目标 Workspace。
+3. 导入仓库根目录的 `EX咖喱棒.yml`。
+4. 安装工作流缺少的模型插件，并配置模型供应商凭据。
+5. 创建或选择 Dataset 知识库。
+6. 将工作流里的知识库检索节点绑定到你的 Dataset。
+7. 发布应用。
+8. 复制 App API Key，填入 `.env` 的 `DIFY_API_KEY`。
 
-CloudRAG 后端会按下面结构调用 Dify Chat Messages API：
+CloudRAG 后端会把用户输入转发给 Dify Chatflow 的用户输入节点，核心请求结构如下：
 
 ```json
 {
@@ -101,142 +108,131 @@ CloudRAG 后端会按下面结构调用 Dify Chat Messages API：
   },
   "query": "用户问题",
   "response_mode": "streaming",
-  "user": "username"
+  "user": "channel-user-id"
 }
 ```
 
-## 导入示例知识库文档
+## 一键启动
 
-推荐将 `structured_markdown_retrieval/` 中的 Markdown 文件导入 Dify 知识库。这些文件已经增加来源、章节标题和检索关键词提示，更适合混合检索。
-
-推荐的 Dify 知识库设置：
-
-- 索引模式：高质量。
-- 分段模式：自定义。
-- 分段符：`\n## `。
-- 最大分段 Token：约 `800`。
-- 检索方式：混合检索。
-- Top K：`20`。
-- Score threshold：关闭或设为 `0`。
-- Rerank：如果模型供应商已配置，建议开启。
-
-也可以使用同步脚本上传：
-
-```bash
-pip install -r backend/requirements.txt
-
-export DIFY_BASE_URL=http://localhost/v1
-export DIFY_DATASET_API_KEY=your-dataset-api-key
-export DIFY_DATASET_ID=your-dataset-id
-export LOCAL_FILE_DIR=structured_markdown_retrieval
-
-python sync_script.py --source-dir structured_markdown_retrieval
-```
-
-Windows PowerShell：
+在项目根目录执行：
 
 ```powershell
-$env:DIFY_BASE_URL="http://localhost/v1"
-$env:DIFY_DATASET_API_KEY="your-dataset-api-key"
-$env:DIFY_DATASET_ID="your-dataset-id"
-$env:LOCAL_FILE_DIR="structured_markdown_retrieval"
-
-python sync_script.py --source-dir structured_markdown_retrieval
-```
-
-## 使用 Docker Compose 启动
-
-确认 `.env` 已配置后，在项目根目录执行：
-
-```bash
 docker compose up -d --build
 ```
 
-Compose 会同时启动 4 个服务：
+启动后默认访问：
 
-- `frontend`：前端页面，默认访问 `http://localhost:8081`。
-- `backend`：CloudRAG FastAPI 网关，容器内端口 `8080`。
-- `agent-server`：本地文件库 Agent 服务，默认访问 `http://localhost:8090/health`。
-- `postgres`：CloudRAG 本地数据库。
+- Web 页面：http://localhost:8081
+- 后端健康检查：http://localhost:8080/health
+- 微信通道状态：http://localhost:8080/api/v1/clawbot/weixin-state
 
-查看日志：
-
-```bash
-docker compose logs -f backend
-docker compose logs -f agent-server
-docker compose logs -f frontend
-```
-
-默认初始化账号在 `backend/init.sql` 中：
+默认初始化账号：
 
 ```text
 admin / Admin@123456
 demo_user / Demo@123456
 ```
 
+公开部署前请修改默认账号、数据库密码和 JWT 密钥。
+
+查看日志：
+
+```powershell
+docker compose logs -f backend
+docker compose logs -f frontend
+docker compose logs -f knowledge-sync
+```
+
+## 微信通道
+
+微信通道沿用 Web 端的大部分交互逻辑，区别是“打开/查看文件”必须回传文件本体。
+
+当前链路：
+
+1. 后端连接 ClawBot/iLink。
+2. 后端主动轮询微信消息。
+3. 文本消息转发到 Dify，再通过微信文本消息回给用户。
+4. 文件消息下载后写入 `knowledge/`，再回确认消息。
+5. “打开/查看 文件名”会从 `knowledge/` 查找文件，并调用微信 send-file。
+
+连接后可以检查：
+
+```powershell
+Invoke-RestMethod http://localhost:8080/api/v1/clawbot/weixin-state
+```
+
+返回中的 `connected`、`running`、`polling` 为 `true` 时，说明通道轮询已经启动。
+
+## 文件库同步
+
+`knowledge-sync` 容器默认每 60 秒扫描一次 `knowledge/`。配置这些变量后，它会把文件清洗成 Markdown 并上传到 Dify Dataset：
+
+```env
+DIFY_DATASET_API_KEY=your-dataset-api-key
+DIFY_DATASET_ID=your-dataset-id
+CLOUDRAG_DEEPSEEK_API_KEY=your-cleaning-model-key
+SYNC_INTERVAL_SECONDS=60
+SYNC_RUN_ON_START=true
+```
+
+如果这些变量为空，同步容器会保持运行但跳过上传，不影响 Web 和微信网关启动。
+
+也可以本地手动运行同步脚本：
+
+```powershell
+pip install -r knowledge-sync-requirements.txt
+python sync_script.py --source-dir knowledge
+```
 
 ## 本地开发
 
-后端网关：
+后端：
 
-```bash
+```powershell
 cd backend
 pip install -r requirements.txt
 uvicorn src.main:app --host 0.0.0.0 --port 8080 --reload
 ```
 
-文件库 Agent 服务：
-
-```bash
-pip install -r agent-server-requirements.txt
-python agent_server.py
-```
-
-如需修改文件库目录：
-
-```bash
-export AGENT_KNOWLEDGE_DIR=knowledge
-export AGENT_PORT=8090
-python agent_server.py
-```
-
-Windows PowerShell：
-
-```powershell
-$env:AGENT_KNOWLEDGE_DIR="knowledge"
-$env:AGENT_PORT="8090"
-python agent_server.py
-```
-
 前端：
 
-```bash
+```powershell
 cd frontend
 npm install
 npm run dev
 ```
 
-## 测试
+可选文件库服务：
 
-后端和同步脚本测试：
-
-```bash
-pip install -r backend/requirements.txt
-pip install -r agent-server-requirements.txt
-python -m pytest
+```powershell
+pip install fastapi uvicorn python-multipart
+python agent_server.py
 ```
 
-前端测试与构建：
+## 发布检查
 
-```bash
-cd frontend
-npm install
-npx vitest run
-npm run build
-```
+提交前建议检查：
 
-Compose 配置检查：
-
-```bash
+```powershell
 docker compose config --quiet
+python -m py_compile backend\src\services\channels.py backend\src\routes\channels.py backend\src\routes\clawbot.py backend\src\services\dify.py sync_script.py agent_server.py
+git status --short
 ```
+
+确认不要提交：
+
+- `.env`
+- Dify、模型供应商、微信或 JWT 的真实密钥
+- `tests/`
+- `reports/`
+- `.pytest_cache/`
+- `sync_ledger*.json`
+- `dify_backups/`
+- `backend/uploads/`
+- `frontend/node_modules/`
+
+## 说明
+
+- `api-contract.md` 不作为当前项目真实接口依据。
+- 后端只负责鉴权、通道适配、请求转发、文件落库、流式透传和微信回传。
+- RAG、Embedding、Chunk、重排、清洗与 Dataset 索引由 Dify 工作流和同步脚本负责。

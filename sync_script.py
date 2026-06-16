@@ -12,8 +12,10 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -38,6 +40,10 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 UPLOAD_TIMEOUT_SECONDS = int(os.getenv("DIFY_DATASET_UPLOAD_TIMEOUT", "300"))
+CLEANED_MARKDOWN_MIN_BODY_SIMILARITY = float(
+    os.getenv("CLEANED_MARKDOWN_MIN_BODY_SIMILARITY", "0.95")
+)
+PIPELINE_VERSION = os.getenv("RAG_SYNC_PIPELINE_VERSION", "deepseek-preserve-v2")
 SUPPORTED_EXTENSIONS = {
     ".csv",
     ".doc",
@@ -168,6 +174,8 @@ def needs_upload(file_state: FileState, ledger: dict[str, Any], *, pipeline: str
         return True
     if record.get("pipeline", "direct") != pipeline:
         return True
+    if pipeline == "deepseek" and record.get("pipeline_version") != PIPELINE_VERSION:
+        return True
     return not (
         record.get("status") == "synced"
         and record.get("sha256") == file_state.sha256
@@ -233,6 +241,74 @@ def add_retrieval_hints(markdown: str, file_name: str) -> str:
     return "\n".join(enhanced)
 
 
+RETRIEVAL_HINT_PREFIXES = (
+    "来源文件：",
+    "文档名称：",
+    "章节标题：",
+    "检索关键词：",
+)
+
+
+def strip_retrieval_hints(markdown: str) -> str:
+    return "\n".join(
+        line
+        for line in markdown.splitlines()
+        if not line.strip().startswith(RETRIEVAL_HINT_PREFIXES)
+    )
+
+
+def normalize_body_for_similarity(text: str) -> str:
+    text = strip_retrieval_hints(text)
+    text = re.sub(r"[#>*_`|\\\-:：,，.。;；!！?？()（）\[\]{}<>《》\"“”'‘’/]+", "", text)
+    text = re.sub(r"\s+", "", text)
+    return text.lower()
+
+
+def markdown_body_similarity(source_text: str, markdown: str) -> float:
+    """Return how much of the source body is retained in cleaned Markdown.
+
+    The score is source-coverage oriented: retrieval hints and Markdown syntax
+    are ignored, and extra section labels do not hide source truncation.
+    """
+
+    source = normalize_body_for_similarity(source_text)
+    cleaned = normalize_body_for_similarity(markdown)
+    if not source and not cleaned:
+        return 1.0
+    if not source or not cleaned:
+        return 0.0
+    matcher = SequenceMatcher(None, source, cleaned, autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return matched / len(source)
+
+
+def preserved_source_markdown(raw_text: str, file_name: str) -> str:
+    """Convert extracted source text to Markdown while preserving every line."""
+
+    lines = [line.rstrip() for line in raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    body = "\n".join(lines).strip()
+    if not body:
+        return f"## {Path(file_name).stem}\n"
+    if any(line.lstrip().startswith("#") for line in lines):
+        return body + "\n"
+    return f"## {Path(file_name).stem}\n\n{body}\n"
+
+
+def ensure_markdown_body_fidelity(raw_text: str, markdown: str, file_name: str) -> str:
+    similarity = markdown_body_similarity(raw_text, markdown)
+    if similarity >= CLEANED_MARKDOWN_MIN_BODY_SIMILARITY:
+        return markdown
+
+    fallback = preserved_source_markdown(raw_text, file_name)
+    fallback_similarity = markdown_body_similarity(raw_text, fallback)
+    print(
+        "[QUALITY] cleaned markdown body similarity "
+        f"{similarity:.2%} below {CLEANED_MARKDOWN_MIN_BODY_SIMILARITY:.0%}; "
+        f"using source-preserving fallback ({fallback_similarity:.2%}): {file_name}"
+    )
+    return fallback
+
+
 def retrieval_terms(document_name: str, file_name: str, section_title: str) -> list[str]:
     terms = [document_name, file_name, section_title]
     normalized = (
@@ -252,6 +328,20 @@ def retrieval_terms(document_name: str, file_name: str, section_title: str) -> l
         prefix = section_title.split("设计", 1)[0]
         terms.append(f"{prefix}方案")
         terms.append(f"{prefix}部分")
+    combined = f"{document_name} {file_name} {section_title}"
+    if "数据投毒" in combined and any(marker in combined for marker in ("数据", "案例", "实例", "结果", "指标")):
+        terms.extend(
+            [
+                "关键数据",
+                "案例指标",
+                "实验数据",
+                "百分比",
+                "路牌投毒攻击",
+                "量化模型投毒",
+                "目标检测平均精度下降",
+                "虚假舆情数据",
+            ]
+        )
     seen: set[str] = set()
     unique_terms: list[str] = []
     for term in terms:
@@ -447,6 +537,7 @@ def build_upload_candidates(
             raw_text = extract_source_text(file_state.path)
             print(f"[CLEAN] requesting DeepSeek structured markdown: {file_state.relative_path}")
             markdown = cleaner.clean(raw_text)
+            markdown = ensure_markdown_body_fidelity(raw_text, markdown, file_state.path.name)
             output_path = markdown_output_path(file_state, archive_dir)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(
@@ -524,6 +615,8 @@ def record_success(
         "batch": response_payload.get("batch"),
         "pipeline": pipeline,
     }
+    if pipeline == "deepseek":
+        record["pipeline_version"] = PIPELINE_VERSION
     if candidate.generated_relative_path:
         record["generated_file"] = candidate.generated_relative_path
     ledger.setdefault("files", {})[candidate.ledger_key] = record

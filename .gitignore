@@ -28,6 +28,7 @@ dist/
 .svelte-kit/
 coverage/
 htmlcov/
+reports/
 
 # Docker volumes
 postgres_data/
@@ -47,6 +48,7 @@ sync_ledger*.json
 dify_backups/
 backend/uploads/
 frontend/node_modules/
+tests/
 
 # Intermediate generated knowledge artifacts.
 # Keep structured_markdown_retrieval/ if you want to publish the retrieval-optimized demo corpus.
@@ -54,3 +56,4 @@ structured_markdown/
 
 # Local reference materials not intended for GitHub
 其他/
+knowledge/claude配置文件.txt

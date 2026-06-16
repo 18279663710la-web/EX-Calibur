@@ -1,0 +1,8 @@
+![alt text](image.png)
+The bar chart illustrates the number of American households, measured in millions, across five annual income brackets in three specific years: 2007, 2011, and 2015. [第一段：改写题目]
+
+Overall, it is clear that the highest income bracket ($100,000 or more) dominated the chart in most years, while the $75,000–$99,999 cohort consistently ranked at the bottom. Additionally, despite mid-term fluctuations, the numbers of both the richest and the poorest households experienced an overall increase. [第二段：完美的 Overview，归纳出最大、最小和总体趋势]
+
+In terms of the highest earning group ($100,000 or more), the number of households stood at nearly 30 million in 2007 before decreasing modestly to around 27.5 million in 2011. However, this figure surged significantly to reach its peak at approximately 33.8 million in 2015. By contrast, the $75,000–$99,999 category remained the least common, hovering between 13.7 and 15 million throughout the entire period. [第三段：捆绑描写最高项和最低项，进行极限对比]
+
+Regarding the remaining three income brackets, the figures for the two lowest categories (under $25,000 and $25,000–$49,999) followed a similar pattern, both rising slightly in 2011 to around 29 million and 30 million respectively, before dropping marginally in 2015. Meanwhile, the number of households earning between $50,000 and $74,999 remained remarkably stable, staying at just under 22 million in all three years. [第四段：描写中间三档的趋势和相似性]

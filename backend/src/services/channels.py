@@ -1,10 +1,16 @@
+import asyncio
 import base64
+import hashlib
 import io
 import json
+import logging
 import os
 import random
+import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -22,6 +28,10 @@ BOT_TYPE = "3"
 CHANNEL_VERSION = "2.0.0"
 CLIENT_VERSION = "131072"
 QR_MAX_REFRESHES = 10
+MAX_RECENT_WEIXIN_MESSAGES = 1024
+UPLOAD_MAX_RETRIES = 3
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -107,6 +117,195 @@ class ILinkWeixinClient:
     async def get_qrcode_status(self, qrcode: str) -> dict[str, Any]:
         return await self.poll_qr_status(qrcode)
 
+    async def get_updates(self, get_updates_buf: str = "", timeout: int = 35) -> dict[str, Any]:
+        return await self._post_json(
+            "ilink/bot/getupdates",
+            {
+                "get_updates_buf": get_updates_buf,
+            },
+            timeout=timeout + 5,
+        )
+
+    async def get_upload_url(
+        self,
+        *,
+        filekey: str,
+        media_type: int,
+        to_user_id: str,
+        rawsize: int,
+        rawfilemd5: str,
+        filesize: int,
+        aeskey: str,
+    ) -> dict[str, Any]:
+        return await self._post_json(
+            "ilink/bot/getuploadurl",
+            {
+                "filekey": filekey,
+                "media_type": media_type,
+                "to_user_id": to_user_id,
+                "rawsize": rawsize,
+                "rawfilemd5": rawfilemd5,
+                "filesize": filesize,
+                "aeskey": aeskey,
+                "no_need_thumb": True,
+            },
+        )
+
+    async def send_text(
+        self,
+        *,
+        to_user: str,
+        content: str,
+        context_token: str | None = None,
+    ) -> dict[str, Any]:
+        client_id = uuid.uuid4().hex
+        payload = await self._post_json(
+            "ilink/bot/sendmessage",
+            {
+                "msg": {
+                    "from_user_id": "",
+                    "to_user_id": to_user,
+                    "client_id": client_id[:16],
+                    "message_type": 2,
+                    "message_state": 2,
+                    "context_token": context_token or "",
+                    "item_list": [
+                        {
+                            "type": 1,
+                            "text_item": {"text": content},
+                        }
+                    ],
+                },
+                "base_info": {},
+            },
+        )
+        return {
+            "message_id": _first_str(payload, ("message_id", "msg_id")) or client_id,
+            "transport": "weixin_api",
+            "send_status": "delivered",
+            "raw": payload,
+        }
+
+    async def send_file(
+        self,
+        *,
+        to_user: str,
+        file_name: str,
+        path: str | None = None,
+        content: bytes | None = None,
+        context_token: str | None = None,
+    ) -> dict[str, Any]:
+        client_id = uuid.uuid4().hex[:16]
+        if content is not None and path is None:
+            tmp_dir = Path(os.getenv("TMPDIR", os.getenv("TEMP", "/tmp")))
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            temp_file = tmp_dir / f"wx_upload_{client_id}_{Path(file_name).name}"
+            temp_file.write_bytes(content)
+            path = str(temp_file)
+        if not path:
+            raise ValueError("path or content is required for send_file")
+        upload_result = await asyncio.to_thread(
+            upload_media_to_cdn,
+            self,
+            path,
+            to_user,
+            3,
+        )
+        payload = await self.send_file_item(
+            to=to_user,
+            context_token=context_token or "",
+            encrypt_query_param=upload_result["encrypt_query_param"],
+            aes_key_b64=upload_result["aes_key_b64"],
+            file_name=file_name or Path(path).name,
+            file_size=upload_result["raw_size"],
+        )
+        return {
+            "message_id": _first_str(payload, ("message_id", "msg_id")) or client_id,
+            "transport": "weixin_api",
+            "send_status": "delivered",
+            "raw": payload,
+        }
+
+    async def send_file_item(
+        self,
+        *,
+        to: str,
+        context_token: str,
+        encrypt_query_param: str,
+        aes_key_b64: str,
+        file_name: str,
+        file_size: int,
+        text: str = "",
+    ) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        if text:
+            items.append({"type": 1, "text_item": {"text": text}})
+        items.append(
+            {
+                "type": 4,
+                "file_item": {
+                    "media": {
+                        "encrypt_query_param": encrypt_query_param,
+                        "aes_key": aes_key_b64,
+                        "encrypt_type": 1,
+                    },
+                    "file_name": file_name,
+                    "len": str(file_size),
+                },
+            }
+        )
+        return await self._send_items(to, context_token, items)
+
+    async def send_typing(self, user_id: str, typing_ticket: str, status: int = 1) -> dict[str, Any]:
+        return await self._post_json(
+            "ilink/bot/sendtyping",
+            {
+                "ilink_user_id": user_id,
+                "typing_ticket": typing_ticket,
+                "status": status,
+            },
+            timeout=10,
+        )
+
+    async def get_config(self, user_id: str, context_token: str = "") -> dict[str, Any]:
+        return await self._post_json(
+            "ilink/bot/getconfig",
+            {
+                "ilink_user_id": user_id,
+                "context_token": context_token,
+            },
+            timeout=10,
+        )
+
+    async def _send_items(self, to: str, context_token: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self._post_json(
+            "ilink/bot/sendmessage",
+            {
+                "msg": {
+                    "from_user_id": "",
+                    "to_user_id": to,
+                    "client_id": uuid.uuid4().hex[:16],
+                    "message_type": 2,
+                    "message_state": 2,
+                    "item_list": items,
+                    "context_token": context_token,
+                },
+            },
+        )
+
+    async def _post_json(self, path: str, body: dict[str, Any], timeout: int | None = None) -> dict[str, Any]:
+        url = _ensure_trailing_slash(self.base_url) + path
+        body.setdefault("base_info", {}).setdefault("channel_version", CHANNEL_VERSION)
+        async with httpx.AsyncClient(timeout=timeout or self.timeout) as client:
+            response = await client.post(url, headers=_build_headers(self.token), json=body)
+        response.raise_for_status()
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {"raw_text": response.text}
+
 
 class ChannelManager:
     def __init__(
@@ -114,6 +313,7 @@ class ChannelManager:
         *,
         weixin_client: ILinkWeixinClient | None = None,
         credentials_path: str | None = None,
+        knowledge_dir: str | Path | None = None,
     ):
         settings = get_settings()
         self._started = False
@@ -123,6 +323,12 @@ class ChannelManager:
             token=settings.weixin_token,
         )
         self.credentials_path = credentials_path or settings.weixin_credentials_path
+        self.knowledge_dir = Path(knowledge_dir or os.getenv("AGENT_KNOWLEDGE_DIR", "knowledge")).resolve()
+        self._seen_message_ids: dict[str, str] = {}
+        self._weixin_context_tokens: dict[str, str] = {}
+        self._weixin_updates_cursor = ""
+        self._weixin_poll_task: asyncio.Task | None = None
+        self._weixin_stop_event = asyncio.Event()
         self._channels: dict[str, ChannelState] = {
             "weixin": ChannelState(
                 name="weixin",
@@ -149,9 +355,13 @@ class ChannelManager:
     async def startup(self):
         self._started = True
         self._load_weixin_credentials()
+        channel = self._channels.get("weixin")
+        if channel and channel.connected:
+            self.start_weixin_polling()
 
     async def shutdown(self):
         self._started = False
+        await self.stop_weixin_polling()
         for channel in self._channels.values():
             channel.running = False
 
@@ -164,6 +374,12 @@ class ChannelManager:
     async def connect(self, name: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
         channel = self._require_channel(name)
         if name == "weixin":
+            if channel.connected:
+                self.start_weixin_polling()
+                result = self._qr_result(channel)
+                result["status"] = "connected"
+                result["polling"] = self._weixin_poll_task is not None and not self._weixin_poll_task.done()
+                return result
             return await self.create_qr_login(action="fetch")
 
         channel.running = True
@@ -187,6 +403,7 @@ class ChannelManager:
         channel.qr_refresh_count = 0
         channel.updated_at = _now()
         if name == "weixin":
+            await self.stop_weixin_polling()
             self._clear_weixin_credentials()
         return {"status": "disconnected", "message": f"{name} channel disconnected"}
 
@@ -200,6 +417,302 @@ class ChannelManager:
             return await self._poll_weixin_qrcode(channel)
 
         return self._qr_result(channel)
+
+    def store_weixin_file(
+        self,
+        *,
+        file_name: str,
+        body: bytes,
+    ) -> dict[str, Any]:
+        safe_name = Path(str(file_name or "upload.bin").replace("\\", "/")).name
+        if not safe_name:
+            safe_name = "upload.bin"
+        self.knowledge_dir.mkdir(parents=True, exist_ok=True)
+        target = self.knowledge_dir / safe_name
+        target.write_bytes(body)
+        return {
+            "name": safe_name,
+            "path": str(target),
+            "size_bytes": target.stat().st_size,
+            "extension": target.suffix,
+        }
+
+    def start_weixin_polling(self) -> bool:
+        channel = self._channels.get("weixin")
+        if not channel or not channel.connected:
+            return False
+        if not getattr(self.weixin_client, "token", ""):
+            return False
+        if self._weixin_poll_task and not self._weixin_poll_task.done():
+            return True
+        self._weixin_stop_event = asyncio.Event()
+        self._weixin_poll_task = asyncio.create_task(self._weixin_poll_loop())
+        channel.running = True
+        channel.status = "connected"
+        logger.info("weixin polling started")
+        return True
+
+    async def stop_weixin_polling(self):
+        self._weixin_stop_event.set()
+        task = self._weixin_poll_task
+        self._weixin_poll_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        logger.info("weixin polling stopped")
+
+    async def poll_weixin_once(self) -> dict[str, Any]:
+        get_updates = getattr(self.weixin_client, "get_updates", None)
+        if get_updates is None:
+            raise ValueError("WeChat client does not support get_updates")
+        payload = await get_updates(self._weixin_updates_cursor)
+        ret = int(payload.get("ret") or payload.get("errcode") or 0)
+        if ret != 0:
+            return {
+                "status": "error",
+                "ret": ret,
+                "errmsg": payload.get("errmsg") or payload.get("message") or "",
+                "processed": 0,
+                "cursor": self._weixin_updates_cursor,
+            }
+        cursor = payload.get("get_updates_buf")
+        if isinstance(cursor, str) and cursor:
+            self._weixin_updates_cursor = cursor
+        processed = 0
+        for raw_msg in payload.get("msgs") or []:
+            if await self.process_weixin_update(raw_msg):
+                processed += 1
+        return {
+            "status": "ok",
+            "processed": processed,
+            "cursor": self._weixin_updates_cursor,
+        }
+
+    async def process_weixin_update(self, raw_msg: dict[str, Any]) -> bool:
+        if int(raw_msg.get("message_type") or 0) != 1:
+            return False
+        message_id = _first_str_nested(raw_msg, ("message_id", "msg_id", "msgid", "seq", "id"))
+        if self.remember_message(message_id):
+            return False
+        normalized = self.normalize_clawbot_payload(raw_msg)
+        if normalized["event_type"] == "file" and not normalized.get("file_bytes_b64"):
+            downloaded_path = await self._download_weixin_file_item(raw_msg, normalized.get("file_name"))
+            if downloaded_path:
+                normalized["file_bytes_b64"] = base64.b64encode(Path(downloaded_path).read_bytes()).decode("ascii")
+        context_token = normalized.get("context_token")
+        user_id = normalized["user_id"]
+        if context_token:
+            self._weixin_context_tokens[user_id] = context_token
+        if not normalized.get("context_token"):
+            normalized["context_token"] = self._weixin_context_tokens.get(user_id)
+
+        from ..routes.channels import WeixinWebhookRequest, handle_weixin_event
+
+        request = WeixinWebhookRequest(
+            event_type=normalized["event_type"],
+            user_id=user_id,
+            content=normalized.get("content") or "",
+            file_name=normalized.get("file_name"),
+            file_bytes_b64=normalized.get("file_bytes_b64"),
+            context_token=normalized.get("context_token"),
+            message_id=normalized.get("message_id"),
+        )
+        response = await handle_weixin_event(request, manager=self)
+        if response.get("code") != 200:
+            logger.error("weixin update failed message_id=%s response=%s", message_id, response)
+        return True
+
+    async def _download_weixin_file_item(self, raw_msg: dict[str, Any], file_name: str | None) -> str | None:
+        item = _first_message_item(raw_msg)
+        file_item = item.get("file_item") if isinstance(item.get("file_item"), dict) else {}
+        media = file_item.get("media") if isinstance(file_item.get("media"), dict) else {}
+        encrypt_query_param = _first_str(media, ("encrypt_query_param",))
+        aes_key = _first_str(media, ("aes_key",)) or _first_str(file_item, ("aeskey",))
+        if not encrypt_query_param or not aes_key:
+            return None
+        safe_name = Path(str(file_name or file_item.get("file_name") or uuid.uuid4().hex)).name
+        tmp_dir = Path(os.getenv("TMPDIR", os.getenv("TEMP", "/tmp")))
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        save_path = tmp_dir / f"wx_inbound_{uuid.uuid4().hex[:8]}_{safe_name}"
+        return await asyncio.to_thread(
+            download_media_from_cdn,
+            getattr(self.weixin_client, "cdn_base_url", CDN_BASE_URL),
+            encrypt_query_param,
+            aes_key,
+            str(save_path),
+        )
+
+    async def _weixin_poll_loop(self):
+        failures = 0
+        while not self._weixin_stop_event.is_set():
+            try:
+                await self.poll_weixin_once()
+                failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures += 1
+                logger.error("weixin polling failed count=%s error=%s", failures, exc, exc_info=True)
+            delay = 2 if failures < 3 else 30
+            try:
+                await asyncio.wait_for(self._weixin_stop_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+
+    def build_send_file_payload(self, *, to_user: str, filename: str) -> dict[str, Any]:
+        target = self.resolve_knowledge_file(filename)
+        if target is None:
+            raise FileNotFoundError(filename)
+        return {
+            "to_user": to_user,
+            "file_name": target.name,
+            "path": str(target),
+            "size_bytes": target.stat().st_size,
+            "transfer_method": "local_file_path",
+        }
+
+    def resolve_knowledge_file(self, filename: str) -> Path | None:
+        requested = Path(str(filename or "").replace("\\", "/")).name
+        if not requested:
+            return None
+        if not self.knowledge_dir.exists():
+            return None
+
+        files = [path for path in self.knowledge_dir.rglob("*") if path.is_file()]
+        for path in files:
+            if path.name == requested:
+                return path
+        requested_lower = requested.lower()
+        for path in files:
+            if path.name.lower() == requested_lower:
+                return path
+        return None
+
+    async def send_weixin_text_reply(
+        self,
+        *,
+        to_user: str,
+        content: str,
+        context_token: str | None = None,
+    ) -> dict[str, Any]:
+        if self._should_simulate_delivery(context_token):
+            return self._simulated_delivery(to_user=to_user)
+        send_text = getattr(self.weixin_client, "send_text", None)
+        if send_text is None:
+            raise ValueError("WeChat client does not support send_text")
+        return _normalize_delivery_result(
+            await send_text(to_user=to_user, content=content, context_token=context_token),
+            to_user=to_user,
+        )
+
+    async def send_weixin_file_reply(
+        self,
+        *,
+        to_user: str,
+        file_name: str,
+        path: str | None = None,
+        content: bytes | None = None,
+        context_token: str | None = None,
+    ) -> dict[str, Any]:
+        if self._should_simulate_delivery(context_token):
+            return self._simulated_delivery(to_user=to_user)
+        send_file = getattr(self.weixin_client, "send_file", None)
+        if send_file is None:
+            raise ValueError("WeChat client does not support send_file")
+        return _normalize_delivery_result(
+            await send_file(
+                to_user=to_user,
+                file_name=file_name,
+                path=path,
+                content=content,
+                context_token=context_token,
+            ),
+            to_user=to_user,
+        )
+
+    def remember_message(self, message_id: str | None) -> bool:
+        value = str(message_id or "").strip()
+        if not value:
+            return False
+        if value in self._seen_message_ids:
+            return True
+        self._seen_message_ids[value] = _now()
+        while len(self._seen_message_ids) > MAX_RECENT_WEIXIN_MESSAGES:
+            self._seen_message_ids.pop(next(iter(self._seen_message_ids)))
+        return False
+
+    def normalize_clawbot_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        item = _first_message_item(payload)
+        item_type = item.get("type")
+        file_item = item.get("file_item") if isinstance(item.get("file_item"), dict) else {}
+        content = _first_str_nested(payload, ("content", "text", "query")) or _text_from_item(item)
+        file_name = (
+            _first_str_nested(payload, ("file_name", "filename", "name"))
+            or _first_str(file_item, ("file_name", "filename", "name"))
+        )
+        file_bytes_b64 = _first_str_nested(payload, ("file_bytes_b64", "file_base64", "base64"))
+        if not file_bytes_b64 and isinstance(file_item.get("content_b64"), str):
+            file_bytes_b64 = file_item["content_b64"]
+        if not file_bytes_b64:
+            file_path = _first_str_nested(payload, ("file_path", "local_path", "path"))
+            if file_path and Path(file_path).is_file():
+                file_bytes_b64 = base64.b64encode(Path(file_path).read_bytes()).decode("ascii")
+
+        user_id = _first_str_nested(
+            payload,
+            (
+                "from_user_id",
+                "from_user",
+                "from_wxid",
+                "talker",
+                "sender",
+                "sender_id",
+                "user_id",
+            ),
+        )
+        if not user_id:
+            raise ValueError("ClawBot payload missing from_user_id")
+
+        if file_name and (file_bytes_b64 or item_type == 4):
+            event_type = "file"
+        elif file_name or _looks_like_open_file(content):
+            event_type = "open_file"
+        else:
+            event_type = "text"
+
+        normalized = {
+            "event_type": event_type,
+            "user_id": user_id,
+            "content": content or "",
+            "file_name": file_name,
+            "file_bytes_b64": file_bytes_b64,
+            "context_token": _first_str_nested(payload, ("context_token", "contextToken")),
+            "message_id": _first_str_nested(
+                payload,
+                ("message_id", "msg_id", "msgid", "client_id", "id"),
+            ),
+        }
+        logger.info(
+            "weixin inbound normalized event_type=%s user_id=%s message_id=%s",
+            normalized["event_type"],
+            normalized["user_id"],
+            normalized["message_id"],
+        )
+        return normalized
+
+    def _should_simulate_delivery(self, context_token: str | None) -> bool:
+        return isinstance(self.weixin_client, ILinkWeixinClient) and not self.weixin_client.token
+
+    def _simulated_delivery(self, *, to_user: str) -> dict[str, Any]:
+        return {
+            "to_user": to_user,
+            "message_id": f"simulated-{uuid.uuid4().hex[:12]}",
+            "transport": "simulation",
+            "send_status": "simulated",
+        }
 
     async def _fetch_weixin_qrcode(
         self,
@@ -255,11 +768,10 @@ class ChannelManager:
             channel.connected = True
             channel.status = "connected"
             channel.bot_id = bot_id
-            if hasattr(self.weixin_client, "token"):
-                self.weixin_client.token = bot_token
-            if hasattr(self.weixin_client, "base_url"):
-                self.weixin_client.base_url = result_base_url
+            setattr(self.weixin_client, "token", bot_token)
+            setattr(self.weixin_client, "base_url", result_base_url)
             self._save_weixin_credentials(payload, bot_token, result_base_url, bot_id)
+            self.start_weixin_polling()
         elif status == "expired":
             channel.qr_refresh_count += 1
             if channel.qr_refresh_count >= QR_MAX_REFRESHES:
@@ -299,12 +811,11 @@ class ChannelManager:
         if not bot_token:
             return
         base_url = _first_str(credentials, ("base_url", "baseurl"))
-        if hasattr(self.weixin_client, "token"):
-            self.weixin_client.token = bot_token
-        if base_url and hasattr(self.weixin_client, "base_url"):
-            self.weixin_client.base_url = base_url
+        setattr(self.weixin_client, "token", bot_token)
+        if base_url:
+            setattr(self.weixin_client, "base_url", base_url)
         channel.connected = True
-        channel.running = False
+        channel.running = self._weixin_poll_task is not None and not self._weixin_poll_task.done()
         channel.status = "connected"
         channel.login_status = "confirmed"
         channel.bot_id = _first_str(credentials, ("bot_id", "ilink_bot_id", "uin", "wxid", "robot_id"))
@@ -389,6 +900,19 @@ def _first_str(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     return None
 
 
+def _first_str_nested(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    value = _first_str(payload, keys)
+    if value:
+        return value
+    for nested_key in ("msg", "message", "payload"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            value = _first_str_nested(nested, keys)
+            if value:
+                return value
+    return None
+
+
 def _normalize_qr_status(payload: dict[str, Any]) -> str:
     raw = _first_str(payload, ("status", "qr_status", "state")) or str(payload.get("code", ""))
     normalized = raw.lower()
@@ -409,6 +933,185 @@ def _qr_data_uri(value: str) -> str:
     image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def _aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
+    from Crypto.Cipher import AES
+
+    pad_len = 16 - (len(data) % 16)
+    padded = data + bytes([pad_len] * pad_len)
+    cipher = AES.new(key, AES.MODE_ECB)
+    return cipher.encrypt(padded)
+
+
+def _aes_ecb_decrypt(data: bytes, key: bytes) -> bytes:
+    from Crypto.Cipher import AES
+
+    cipher = AES.new(key, AES.MODE_ECB)
+    decrypted = cipher.decrypt(data)
+    pad_len = decrypted[-1]
+    if pad_len > 16:
+        return decrypted
+    return decrypted[:-pad_len]
+
+
+def _md5_bytes(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+def _aes_ecb_padded_size(plaintext_size: int) -> int:
+    return ((plaintext_size + 1 + 15) // 16) * 16
+
+
+async def _run_sync_awaitable(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def upload_media_to_cdn(api: ILinkWeixinClient, file_path: str, to_user_id: str, media_type: int) -> dict[str, Any]:
+    aes_key = os.urandom(16)
+    aes_key_hex = aes_key.hex()
+    filekey = uuid.uuid4().hex
+    raw_data = Path(file_path).read_bytes()
+    raw_size = len(raw_data)
+    raw_md5 = _md5_bytes(raw_data)
+    cipher_size = _aes_ecb_padded_size(raw_size)
+    encrypted = _aes_ecb_encrypt(raw_data, aes_key)
+
+    async def _upload_once() -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
+            current_filekey = filekey if attempt == 1 else uuid.uuid4().hex
+            try:
+                upload_meta = await api.get_upload_url(
+                    filekey=current_filekey,
+                    media_type=media_type,
+                    to_user_id=to_user_id,
+                    rawsize=raw_size,
+                    rawfilemd5=raw_md5,
+                    filesize=cipher_size,
+                    aeskey=aes_key_hex,
+                )
+                upload_full_url = upload_meta.get("upload_full_url", "")
+                upload_param = upload_meta.get("upload_param", "")
+                if upload_full_url:
+                    cdn_url = upload_full_url
+                elif upload_param:
+                    cdn_url = (
+                        f"{api.cdn_base_url}/upload"
+                        f"?encrypted_query_param={quote(upload_param)}"
+                        f"&filekey={quote(current_filekey)}"
+                    )
+                else:
+                    raise RuntimeError(f"getUploadUrl missing upload URL: {upload_meta}")
+                async with httpx.AsyncClient(timeout=120) as client:
+                    response = await client.post(
+                        cdn_url,
+                        content=encrypted,
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Content-Length": str(len(encrypted)),
+                        },
+                    )
+                if 400 <= response.status_code < 500:
+                    raise RuntimeError(
+                        f"CDN client error {response.status_code}: "
+                        f"{response.headers.get('x-error-message', response.text[:200])}"
+                    )
+                response.raise_for_status()
+                download_param = response.headers.get("x-encrypted-param", "")
+                if not download_param:
+                    raise RuntimeError("CDN response missing x-encrypted-param header")
+                return {
+                    "encrypt_query_param": download_param,
+                    "aes_key_b64": base64.b64encode(aes_key_hex.encode("utf-8")).decode("utf-8"),
+                    "ciphertext_size": cipher_size,
+                    "raw_size": raw_size,
+                }
+            except Exception as exc:
+                last_error = exc
+                if attempt >= UPLOAD_MAX_RETRIES or "CDN client error" in str(exc):
+                    break
+        raise last_error or RuntimeError("CDN upload failed")
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_upload_once())
+    finally:
+        loop.close()
+
+
+def download_media_from_cdn(
+    cdn_base_url: str,
+    encrypt_query_param: str,
+    aes_key: str,
+    save_path: str,
+) -> str:
+    url = f"{cdn_base_url}/download?encrypted_query_param={quote(encrypt_query_param)}"
+    response = httpx.get(url, timeout=60)
+    response.raise_for_status()
+
+    try:
+        key_bytes = bytes.fromhex(aes_key)
+        if len(key_bytes) != 16:
+            raise ValueError()
+    except (ValueError, TypeError):
+        decoded = base64.b64decode(aes_key)
+        if len(decoded) == 32:
+            key_bytes = bytes.fromhex(decoded.decode("ascii"))
+        elif len(decoded) == 16:
+            key_bytes = decoded
+        else:
+            raise ValueError(f"Invalid AES key length after base64 decode: {len(decoded)}")
+
+    decrypted = _aes_ecb_decrypt(response.content, key_bytes)
+    target = Path(save_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(decrypted)
+    return str(target)
+
+
+def extract_open_filename(content: str) -> str:
+    text = str(content or "").strip()
+    text = re.sub(r"^(打开|查看|预览|发送|回传)\s*", "", text)
+    return text.strip()
+
+
+def _normalize_delivery_result(result: Any, *, to_user: str) -> dict[str, Any]:
+    payload = result if isinstance(result, dict) else {}
+    return {
+        "to_user": to_user,
+        "message_id": _first_str(payload, ("message_id", "msg_id")) or f"wx-{uuid.uuid4().hex[:12]}",
+        "transport": _first_str(payload, ("transport",)) or "weixin_api",
+        "send_status": _first_str(payload, ("send_status", "status")) or "delivered",
+    }
+
+
+def _first_message_item(payload: dict[str, Any]) -> dict[str, Any]:
+    item_list = payload.get("item_list") or payload.get("items") or []
+    if isinstance(item_list, list):
+        for item in item_list:
+            if isinstance(item, dict):
+                return item
+    msg = payload.get("msg")
+    if isinstance(msg, dict):
+        return _first_message_item(msg)
+    return {}
+
+
+def _text_from_item(item: dict[str, Any]) -> str:
+    text_item = item.get("text_item")
+    if isinstance(text_item, dict):
+        return _first_str(text_item, ("text", "string")) or ""
+    return ""
+
+
+def _looks_like_open_file(content: str) -> bool:
+    text = str(content or "").strip()
+    return bool(
+        re.match(r"^(打开|查看|预览|发送|回传|鎵撳紑|鏌ョ湅|棰勮|鍙戦€亅鍥炰紶)\s+", text)
+    )
 
 
 _channel_manager: ChannelManager | None = None

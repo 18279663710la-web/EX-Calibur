@@ -40,6 +40,43 @@ class OpenRequest(BaseModel):
     filename: str
 
 
+def _iter_knowledge_files() -> list[Path]:
+    knowledge_dir = ensure_knowledge_dir()
+    files: list[Path] = []
+    for root, _, names in os.walk(knowledge_dir):
+        files.extend(Path(root) / name for name in names)
+    return files
+
+
+def _requested_basename(filename: str) -> str:
+    return Path(str(filename or "").replace("\\", "/")).name
+
+
+def resolve_file(filename: str) -> Path | None:
+    requested = _requested_basename(filename)
+    if not requested:
+        return None
+
+    files = _iter_knowledge_files()
+    for path in files:
+        if path.name == requested:
+            return path
+
+    requested_lower = requested.lower()
+    for path in files:
+        if path.name.lower() == requested_lower:
+            return path
+
+    matches = [
+        (fuzz.partial_ratio(requested_lower, path.name.lower()), path)
+        for path in files
+    ]
+    if not matches:
+        return None
+    score, path = max(matches, key=lambda item: item[0])
+    return path if score >= 85 else None
+
+
 def search_files(keyword: str, top_k: int = 5) -> list[dict[str, object]]:
     knowledge_dir = ensure_knowledge_dir()
     results: list[dict[str, object]] = []
@@ -73,23 +110,32 @@ async def search(req: SearchRequest) -> dict[str, object]:
 
 
 @app.post("/open")
-async def open_file(req: OpenRequest) -> dict[str, str]:
-    knowledge_dir = ensure_knowledge_dir()
-    target_path: Path | None = None
-
-    for root, _, files in os.walk(knowledge_dir):
-        if req.filename in files:
-            target_path = Path(root) / req.filename
-            break
+async def open_file(req: OpenRequest) -> dict[str, object]:
+    target_path = resolve_file(req.filename)
 
     if not target_path:
         raise HTTPException(status_code=404, detail="文件不存在")
 
     try:
-        if not hasattr(os, "startfile"):
-            raise RuntimeError("当前运行环境不支持直接打开本地文件")
-        os.startfile(target_path)  # type: ignore[attr-defined]
-        return {"status": "success", "filename": req.filename}
+        if hasattr(os, "startfile"):
+            os.startfile(target_path)  # type: ignore[attr-defined]
+            return {
+                "status": "success",
+                "opened": True,
+                "open_method": "os.startfile",
+                "filename": target_path.name,
+                "requested_filename": req.filename,
+                "path": str(target_path),
+            }
+        return {
+            "status": "success",
+            "opened": False,
+            "open_method": "path_returned",
+            "filename": target_path.name,
+            "requested_filename": req.filename,
+            "path": str(target_path),
+            "message": "Native file opening is unavailable in this runtime; use the returned path.",
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
