@@ -108,7 +108,7 @@ services:
       RAG_SYNC_PIPELINE: ${RAG_SYNC_PIPELINE:-deepseek}
       DEEPSEEK_API_KEY: ${CLOUDRAG_DEEPSEEK_API_KEY:-}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
-      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
     volumes:
       - ./knowledge:/app/knowledge:ro
       - ./sync_ledger.json:/app/state/sync_ledger.json

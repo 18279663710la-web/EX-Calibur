@@ -42,7 +42,7 @@ STRUCTURED_MARKDOWN_DIR = Path(
 )
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 
 UPLOAD_TIMEOUT_SECONDS = int(os.getenv("DIFY_DATASET_UPLOAD_TIMEOUT", "300"))
 CLEANED_MARKDOWN_MIN_BODY_SIMILARITY = float(
@@ -116,6 +116,10 @@ def normalize_base_url(base_url: str) -> str:
 
 def upload_url(base_url: str, dataset_id: str) -> str:
     return f"{normalize_base_url(base_url)}/datasets/{dataset_id}/document/create-by-file"
+
+
+def document_url(base_url: str, dataset_id: str, document_id: str) -> str:
+    return f"{normalize_base_url(base_url)}/datasets/{dataset_id}/documents/{document_id}"
 
 
 def load_ledger(ledger_path: Path) -> dict[str, Any]:
@@ -254,6 +258,35 @@ def list_dataset_documents(
     return documents
 
 
+def clear_dataset_documents(
+    *,
+    base_url: str,
+    dataset_api_key: str,
+    dataset_id: str,
+    remote_documents: list[dict[str, Any]],
+    session: requests.Session,
+) -> int:
+    headers = {"Authorization": f"Bearer {dataset_api_key}"}
+    deleted = 0
+    for document in remote_documents:
+        document_id = document.get("id") if isinstance(document, dict) else None
+        if not isinstance(document_id, str) or not document_id:
+            continue
+        response = session.delete(
+            document_url(base_url, dataset_id, document_id),
+            headers=headers,
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            raise requests.HTTPError(
+                f"{response.status_code} {response.reason}: {response.text[:1000]}",
+                response=response,
+            )
+        deleted += 1
+        print(f"[CLEAR] deleted Dify document: {document_id}")
+    return deleted
+
+
 def refresh_ledger_whitelist(
     ledger: dict[str, Any],
     files: list[FileState],
@@ -333,11 +366,83 @@ def dify_custom_markdown_payload() -> dict[str, Any]:
                 ],
                 "segmentation": {
                     "separator": "\n## ",
-                    "max_tokens": 800,
+                    "max_tokens": 1400,
                 }
             },
         },
     }
+
+
+STRUCTURAL_HEADING_RE = re.compile(
+    r"^(?P<title>[一二三四五六七八九十]+[、.．]\s*.+|第[一二三四五六七八九十\d]+[章节节]\s*.+)$"
+)
+
+
+def promote_structural_headings(markdown: str) -> str:
+    promoted: list[str] = []
+    in_code = False
+    for line in markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            promoted.append(line)
+            continue
+        if not in_code and STRUCTURAL_HEADING_RE.match(stripped) and not stripped.startswith("#"):
+            promoted.append(f"## {stripped}")
+            continue
+        promoted.append(line)
+    return "\n".join(promoted)
+
+
+def split_markdown_into_sections(markdown: str) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    current_title = ""
+    current_lines: list[str] = []
+    code_index = 0
+    current_code_ids: list[str] = []
+    in_code = False
+
+    def flush_section() -> None:
+        nonlocal current_lines, current_code_ids
+        if current_title or any(line.strip() for line in current_lines):
+            body = "\n".join(current_lines).strip()
+            sections.append(
+                {
+                    "section": current_title,
+                    "body": body,
+                    "code_block_ids": list(current_code_ids),
+                }
+            )
+        current_lines = []
+        current_code_ids = []
+
+    for line in markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if in_code:
+                code_index += 1
+                current_code_ids.append(f"code-{code_index:04d}")
+                in_code = False
+            else:
+                in_code = True
+            current_lines.append(line)
+            continue
+
+        if stripped.startswith("## "):
+            flush_section()
+            current_title = stripped[3:].strip()
+            current_lines = [line]
+            continue
+
+        current_lines.append(line)
+
+    flush_section()
+    return sections
+
+
+def enhance_markdown_for_retrieval(markdown: str, file_name: str) -> str:
+    del file_name
+    return promote_structural_headings(strip_retrieval_hints(markdown)).strip() + "\n"
 
 
 def add_retrieval_hints(markdown: str, file_name: str) -> str:
@@ -369,19 +474,61 @@ def add_retrieval_hints(markdown: str, file_name: str) -> str:
 
 
 RETRIEVAL_HINT_PREFIXES = (
+    "锚点ID：",
+    "RAG_META:",
+    "anchor_id:",
+    "source_file:",
+    "document:",
+    "section:",
+    "content_type:",
+    "adjacent:",
+    "keywords:",
+    "code_block_ids:",
+    "code_block_parts:",
     "来源文件：",
     "文档名称：",
     "章节标题：",
+    "当前章节：",
+    "内容类型：",
+    "相邻锚点：",
+    "代码块ID：",
+    "代码块分片：",
     "检索关键词：",
 )
 
 
 def strip_retrieval_hints(markdown: str) -> str:
-    return "\n".join(
-        line
-        for line in markdown.splitlines()
-        if not line.strip().startswith(RETRIEVAL_HINT_PREFIXES)
-    )
+    lines = markdown.splitlines()
+    kept: list[str] = []
+    comment_buffer: list[str] | None = None
+
+    for line in lines:
+        stripped = line.strip()
+        if comment_buffer is not None:
+            comment_buffer.append(line)
+            if "-->" in stripped:
+                if not any("RAG_META:" in buffered for buffered in comment_buffer):
+                    kept.extend(comment_buffer)
+                comment_buffer = None
+            continue
+
+        if stripped.startswith("<!--"):
+            comment_buffer = [line]
+            if "-->" in stripped:
+                if not any("RAG_META:" in buffered for buffered in comment_buffer):
+                    kept.extend(comment_buffer)
+                comment_buffer = None
+            continue
+
+        if stripped.startswith(RETRIEVAL_HINT_PREFIXES):
+            continue
+
+        kept.append(line)
+
+    if comment_buffer is not None and not any("RAG_META:" in buffered for buffered in comment_buffer):
+        kept.extend(comment_buffer)
+
+    return "\n".join(kept)
 
 
 def normalize_body_for_similarity(text: str) -> str:
@@ -578,13 +725,47 @@ def sanitize_text_for_json(text: str) -> str:
     return text.encode("utf-8", errors="ignore").decode("utf-8")
 
 
-DEEPSEEK_SYSTEM_PROMPT = """你是一个严谨的学术文档处理专家。请将以下粗略提取的实验报告文本重构成规范的 Markdown 文档。
+DEEPSEEK_SYSTEM_PROMPT = """你是一个顶尖的中文技术文档解析专家与 RAG（检索增强生成）知识库结构化专家。请将以下通过 OCR 或粗略提取的、排版混乱的源文本，重构成高质量、易于 RAG 精准检索的分段 Markdown 文档。
 
-配置规范：
-1. 识别实验结构，并严格使用 `## ` 作为核心一级章节标题（例如：## 实验目的、## 实验原理、## 实验步骤、## 实验数据与结果、## 分析与讨论）。
-2. 将文本中散落的实验测试数据和表格信息，智能还原为标准的 Markdown 表格格式（| Header | Header |）。
-3. 彻底滤除类似“第 X 页”、“学号：xxx”、“姓名：xxx”、“评卷人”等无关的重复性页眉页脚及打印噪声。
-4. 【红线要求】必须保持原始实验数据、代码逻辑和学术结论的绝对完整与真实，严禁润色、篡改、总结或删减核心内容。直接输出 Markdown 正文，切勿包含任何自我解释的提示语或包裹性废话。"""
+核心目标：
+1. 最大化保真：100% 保留源文档中的技术细节。严禁润色、删减、归纳、压缩核心正文。
+2. 语义孤岛化：利用稳定的章节边界（## 标题）确保后续知识库切片时，每个分段都是一个独立的、含义完整的知识点，避免上下文断裂。
+3. 纯净输出：直接输出 Markdown 正文，严禁输出任何解释、总结、免责声明或代码围栏外的包裹性废话。
+
+一、 文档类型自适应清洗规则
+请先隐式判断输入文档的类型，并执行对应的清洗策略：
+1. 实验报告/技术作业类：
+   - 必须严格保留：实验目的、实验原理、具体步骤、测试数据、命令日志、实验结论。
+   - 遇到数据表格、数值矩阵、代码输出结果时，必须精确对齐，严禁漏掉任何一个小数点、变量名或配置参数。
+2. 实验模板/空白导向类：
+   - 必须保留文档中的引导性文字、题目要求和评分标准。
+   - 遇到形如 `[请在此处填写]`、`______` 或空白步骤框时，保留其结构占位符，不要将其作为噪声删掉。
+3. 架构设计/技术规范类：
+   - 侧重组件关系、协议流程（如 TCP 握手步骤）、环境配置项。保持逻辑链条的连续性。
+
+二、 章节结构与 RAG 语义锚点注入（核心）
+1. 统一二级标题切块：为了保证后续知识库按段落精准检索，允许将各个“子序号/子要点”（如“1.”、“2.”、“(一)”）升级为 Markdown 的二级标题 `## `。
+2. 强制实施【父级锚点拼接】：任何子序号在升级为 `## ` 标题时，绝对不允许直接暴露孤立的子标题（如严禁出现单独的 `## 1. 交代科技背景`）。必须使用大板块的父级标题作为“语义锚点”向前进行前缀拼接。
+   - 拼接公式：`## [父级大板块标题] - [子序号] [子标题内容]`
+   - 黄金示例：
+     若父级是：`## 一、引言段：引出“科技双刃剑”`
+     子要是：`1. 交代科技背景`
+     大模型必须将其重写并清洗为：`## 一、引言段：引出“科技双刃剑” - 1. 交代科技背景`
+3. 多层嵌套传递：若存在多层嵌套，锚点需逐级向下传递（例如：`## 一、引言段 - 1. 交代背景 - (1) 具体行业案例`），确保每一个被切碎的小 Chunk 中都焊死带有最顶层的核心中文技术名词或分类词。
+4. 头部处理：若文档开头存在无标题的总述，统一加上 `## 文档概述`。
+
+三、 内容高保真格式化规范
+1. 代码块与配置：
+   - 所有代码（Java, Python, C, MATLAB, SQL等）、终端命令（Docker, SSH等）、配置内容（YAML, JSON等）必须严格使用 Markdown 代码围栏（```python ... ```）包裹，并明确指定语言类型。
+   - 严禁拆散或折叠长代码逻辑。
+2. 数据表格：
+   - 粗略文本中的表格线条（如 +, -, | 乱序拼接）必须完全修复为标准的 Markdown 线性表格（| 标题 | 标题 |）。
+   - 如果原表数据过于混乱无法对齐，请将其重构为 key-value 列表形式紧跟在对应的标题下方。
+3. 噪声物理消除：
+   - 必须剔除以下打印噪声：重复的页眉页脚、动态页码（如 "第 3 页 / 共 12 页"）、明显的评卷人签名栏、重复的水印占位符。
+   - 注意：保留学生自填的实验心得、思考题解答，这些属于核心有效内容。
+
+源文本内容如下，请开始进行结构化清洗："""
 
 
 class DeepSeekCleaner:
@@ -623,7 +804,7 @@ class DeepSeekCleaner:
                     {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": f"请对以下原始实验报告内容{chunk_note}进行结构化清洗：\n\n{raw_text}",
+                        "content": f"请对以下源文本内容{chunk_note}进行结构化清洗：\n\n{raw_text}",
                     },
                 ],
                 "temperature": 0.1,
@@ -725,9 +906,10 @@ def build_upload_candidates(
             markdown = cleaner.clean(raw_text)
             markdown = ensure_markdown_body_fidelity(raw_text, markdown, file_state.path.name)
             output_path = markdown_output_path(file_state, archive_dir)
+            markdown = enhance_markdown_for_retrieval(markdown, output_path.name)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(
-                add_retrieval_hints(markdown, output_path.name),
+                markdown,
                 encoding="utf-8",
             )
         except Exception as exc:
@@ -857,6 +1039,7 @@ def run_sync(
     deepseek_model: str = DEEPSEEK_MODEL,
     pipeline: str = "direct",
     cleaner: Cleaner | None = None,
+    clear_remote: bool = False,
 ) -> SyncResult:
     files = iter_supported_files(source_dir)
     ledger = load_ledger(ledger_path)
@@ -898,6 +1081,18 @@ def run_sync(
         dataset_id=dataset_id,
         session=active_session,
     )
+    if clear_remote:
+        deleted = clear_dataset_documents(
+            base_url=base_url,
+            dataset_api_key=dataset_api_key,
+            dataset_id=dataset_id,
+            remote_documents=remote_documents,
+            session=active_session,
+        )
+        print(f"[CLEAR] deleted={deleted}")
+        ledger = {"files": {}, "whitelist": {}}
+        save_ledger(ledger_path, ledger)
+        remote_documents = []
     refresh_ledger_whitelist(ledger, files, remote_documents, pipeline=pipeline)
     save_ledger(ledger_path, ledger)
     pending = [
@@ -997,6 +1192,11 @@ def parse_args() -> argparse.Namespace:
         default=DEEPSEEK_MODEL,
         help="DeepSeek model name.",
     )
+    parser.add_argument(
+        "--clear-remote",
+        action="store_true",
+        help="Delete all existing Dify dataset documents before uploading pending files.",
+    )
     return parser.parse_args()
 
 
@@ -1015,6 +1215,7 @@ def main() -> int:
             deepseek_base_url=args.deepseek_base_url,
             deepseek_model=args.deepseek_model,
             pipeline=args.pipeline,
+            clear_remote=args.clear_remote,
         )
     except ConfigurationError as exc:
         print(f"[CONFIG] {exc}")
