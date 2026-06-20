@@ -29,6 +29,7 @@ dist/
 coverage/
 htmlcov/
 reports/
+outputs/
 
 # Docker volumes
 postgres_data/
@@ -60,3 +61,4 @@ structured_markdown/
 knowledge/claude配置文件.txt
 knowledge/*
 !knowledge/.gitkeep
+structured_markdown_retrieval/

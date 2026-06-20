@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(Get-ChildItem -Recurse -Depth 3)",
-      "Bash(Select-Object FullName)",
-      "PowerShell(Get-ChildItem -Recurse -Depth 3 | ForEach-Object { $_.FullName.Substring\\($PWD.Path.Length + 1\\) } | Sort-Object)"
-    ]
-  }
-}

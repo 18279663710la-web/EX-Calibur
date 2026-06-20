@@ -41,14 +41,14 @@ STRUCTURED_MARKDOWN_DIR = Path(
     os.getenv("STRUCTURED_MARKDOWN_DIR", PROJECT_ROOT / "structured_markdown")
 )
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 
 UPLOAD_TIMEOUT_SECONDS = int(os.getenv("DIFY_DATASET_UPLOAD_TIMEOUT", "300"))
 CLEANED_MARKDOWN_MIN_BODY_SIMILARITY = float(
     os.getenv("CLEANED_MARKDOWN_MIN_BODY_SIMILARITY", "0.95")
 )
-PIPELINE_VERSION = os.getenv("RAG_SYNC_PIPELINE_VERSION", "deepseek-preserve-v2")
+PIPELINE_VERSION = os.getenv("RAG_SYNC_PIPELINE_VERSION", "deepseek-preserve-v3")
 SUPPORTED_EXTENSIONS = {
     ".csv",
     ".doc",
@@ -316,21 +316,39 @@ def refresh_ledger_whitelist(
             else None
         )
         if whitelist_entry:
-            whitelist[file_state.relative_path] = whitelist_entry
-            record.update(
-                {
-                    "status": "synced",
-                    "sha256": file_state.sha256,
-                    "size": file_state.size,
-                    "modified_at": file_state.modified_at,
-                    "document_id": whitelist_entry["document_id"],
-                    "remote_name": whitelist_entry["remote_name"],
-                    "indexing_status": whitelist_entry.get("indexing_status"),
-                    "pipeline": pipeline,
-                }
+            pipeline_version_matches = (
+                pipeline != "deepseek"
+                or record.get("pipeline_version") == PIPELINE_VERSION
             )
-            if pipeline == "deepseek":
-                record["pipeline_version"] = PIPELINE_VERSION
+            if not pipeline_version_matches:
+                record.update(
+                    {
+                        "status": "pending",
+                        "sha256": file_state.sha256,
+                        "size": file_state.size,
+                        "modified_at": file_state.modified_at,
+                        "document_id": whitelist_entry["document_id"],
+                        "remote_name": whitelist_entry["remote_name"],
+                        "indexing_status": whitelist_entry.get("indexing_status"),
+                        "pipeline": pipeline,
+                    }
+                )
+            else:
+                whitelist[file_state.relative_path] = whitelist_entry
+                record.update(
+                    {
+                        "status": "synced",
+                        "sha256": file_state.sha256,
+                        "size": file_state.size,
+                        "modified_at": file_state.modified_at,
+                        "document_id": whitelist_entry["document_id"],
+                        "remote_name": whitelist_entry["remote_name"],
+                        "indexing_status": whitelist_entry.get("indexing_status"),
+                        "pipeline": pipeline,
+                    }
+                )
+                if pipeline == "deepseek":
+                    record["pipeline_version"] = PIPELINE_VERSION
         elif record.get("document_id"):
             record.pop("document_id", None)
             record.pop("remote_name", None)
@@ -394,145 +412,48 @@ def promote_structural_headings(markdown: str) -> str:
     return "\n".join(promoted)
 
 
-def split_markdown_into_sections(markdown: str) -> list[dict[str, Any]]:
-    sections: list[dict[str, Any]] = []
-    current_title = ""
-    current_lines: list[str] = []
-    code_index = 0
-    current_code_ids: list[str] = []
-    in_code = False
+def enhance_markdown_for_retrieval(markdown: str, file_name: str) -> str:
+    markdown = promote_structural_headings(markdown)
+    markdown = add_retrieval_hints(markdown, file_name)
+    return markdown.strip() + "\n"
 
-    def flush_section() -> None:
-        nonlocal current_lines, current_code_ids
-        if current_title or any(line.strip() for line in current_lines):
-            body = "\n".join(current_lines).strip()
-            sections.append(
-                {
-                    "section": current_title,
-                    "body": body,
-                    "code_block_ids": list(current_code_ids),
-                }
-            )
-        current_lines = []
-        current_code_ids = []
+
+def add_retrieval_hints(markdown: str, file_name: str) -> str:
+    """Rewrite headings as semantic anchors without injecting visible metadata blocks."""
+    document_name = Path(file_name).stem
+    anchored: list[str] = []
+    parent_title = document_name
+    seen_titles: set[str] = set()
+    in_code = False
 
     for line in markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         stripped = line.strip()
         if stripped.startswith("```"):
-            if in_code:
-                code_index += 1
-                current_code_ids.append(f"code-{code_index:04d}")
-                in_code = False
-            else:
-                in_code = True
-            current_lines.append(line)
+            in_code = not in_code
+            anchored.append(line)
+            continue
+        if in_code or not stripped.startswith("## "):
+            anchored.append(line)
             continue
 
-        if stripped.startswith("## "):
-            flush_section()
-            current_title = stripped[3:].strip()
-            current_lines = [line]
+        title = stripped[3:].strip()
+        if not title:
+            anchored.append(line)
             continue
-
-        current_lines.append(line)
-
-    flush_section()
-    return sections
-
-
-def enhance_markdown_for_retrieval(markdown: str, file_name: str) -> str:
-    del file_name
-    return promote_structural_headings(strip_retrieval_hints(markdown)).strip() + "\n"
-
-
-def add_retrieval_hints(markdown: str, file_name: str) -> str:
-    """Add source and section terms so Dify keyword retrieval can anchor on files."""
-    if "来源文件：" in markdown:
-        return markdown
-
-    document_name = Path(file_name).stem
-    lines = markdown.splitlines()
-    enhanced: list[str] = []
-    for line in lines:
-        enhanced.append(line)
-        stripped = line.strip()
-        if not stripped.startswith("## "):
+        if title.startswith(document_name):
+            anchored_title = title
+        else:
+            anchored_title = f"{document_name} - {title}"
+        if anchored_title in seen_titles:
+            anchored.append(f"## {anchored_title}")
             continue
-        section_title = stripped[3:].strip()
-        if not section_title:
-            continue
-        enhanced.extend(
-            [
-                f"来源文件：{file_name}",
-                f"文档名称：{document_name}",
-                f"章节标题：{section_title}",
-                f"检索关键词：{' '.join(retrieval_terms(document_name, file_name, section_title))}",
-                "",
-            ]
-        )
-    return "\n".join(enhanced)
+        seen_titles.add(anchored_title)
+        parent_title = anchored_title
+        anchored.append(f"## {anchored_title}")
 
-
-RETRIEVAL_HINT_PREFIXES = (
-    "锚点ID：",
-    "RAG_META:",
-    "anchor_id:",
-    "source_file:",
-    "document:",
-    "section:",
-    "content_type:",
-    "adjacent:",
-    "keywords:",
-    "code_block_ids:",
-    "code_block_parts:",
-    "来源文件：",
-    "文档名称：",
-    "章节标题：",
-    "当前章节：",
-    "内容类型：",
-    "相邻锚点：",
-    "代码块ID：",
-    "代码块分片：",
-    "检索关键词：",
-)
-
-
-def strip_retrieval_hints(markdown: str) -> str:
-    lines = markdown.splitlines()
-    kept: list[str] = []
-    comment_buffer: list[str] | None = None
-
-    for line in lines:
-        stripped = line.strip()
-        if comment_buffer is not None:
-            comment_buffer.append(line)
-            if "-->" in stripped:
-                if not any("RAG_META:" in buffered for buffered in comment_buffer):
-                    kept.extend(comment_buffer)
-                comment_buffer = None
-            continue
-
-        if stripped.startswith("<!--"):
-            comment_buffer = [line]
-            if "-->" in stripped:
-                if not any("RAG_META:" in buffered for buffered in comment_buffer):
-                    kept.extend(comment_buffer)
-                comment_buffer = None
-            continue
-
-        if stripped.startswith(RETRIEVAL_HINT_PREFIXES):
-            continue
-
-        kept.append(line)
-
-    if comment_buffer is not None and not any("RAG_META:" in buffered for buffered in comment_buffer):
-        kept.extend(comment_buffer)
-
-    return "\n".join(kept)
-
+    return "\n".join(anchored)
 
 def normalize_body_for_similarity(text: str) -> str:
-    text = strip_retrieval_hints(text)
     text = re.sub(r"[#>*_`|\\\-:：,，.。;；!！?？()（）\[\]{}<>《》\"“”'‘’/]+", "", text)
     text = re.sub(r"\s+", "", text)
     return text.lower()
@@ -630,27 +551,6 @@ def retrieval_terms(document_name: str, file_name: str, section_title: str) -> l
     for token in normalized.split():
         if len(token) >= 2:
             terms.append(token)
-    if "架构设计" in section_title:
-        terms.append(section_title.replace("架构设计", "设计"))
-        terms.append(section_title.replace("设计", ""))
-    if "端" in section_title and "设计" in section_title:
-        prefix = section_title.split("设计", 1)[0]
-        terms.append(f"{prefix}方案")
-        terms.append(f"{prefix}部分")
-    combined = f"{document_name} {file_name} {section_title}"
-    if "数据投毒" in combined and any(marker in combined for marker in ("数据", "案例", "实例", "结果", "指标")):
-        terms.extend(
-            [
-                "关键数据",
-                "案例指标",
-                "实验数据",
-                "百分比",
-                "路牌投毒攻击",
-                "量化模型投毒",
-                "目标检测平均精度下降",
-                "虚假舆情数据",
-            ]
-        )
     seen: set[str] = set()
     unique_terms: list[str] = []
     for term in terms:
@@ -874,14 +774,31 @@ def build_upload_candidates(
     ledger: dict[str, Any],
 ) -> list[UploadCandidate]:
     if pipeline == "direct":
-        return [
-            UploadCandidate(
-                source=file_state,
-                upload_path=file_state.path,
-                ledger_key=file_state.relative_path,
+        candidates: list[UploadCandidate] = []
+        for file_state in pending:
+            if file_state.path.suffix.lower() in {".md", ".markdown", ".txt"}:
+                raw_text = extract_source_text(file_state.path)
+                output_path = markdown_output_path(file_state, archive_dir)
+                markdown = enhance_markdown_for_retrieval(raw_text, output_path.name)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(markdown, encoding="utf-8")
+                candidates.append(
+                    UploadCandidate(
+                        source=file_state,
+                        upload_path=output_path,
+                        ledger_key=file_state.relative_path,
+                        generated_relative_path=output_path.relative_to(archive_dir).as_posix(),
+                    )
+                )
+                continue
+            candidates.append(
+                UploadCandidate(
+                    source=file_state,
+                    upload_path=file_state.path,
+                    ledger_key=file_state.relative_path,
+                )
             )
-            for file_state in pending
-        ]
+        return candidates
 
     if pipeline != "deepseek":
         raise ConfigurationError(f"Unsupported pipeline: {pipeline}")

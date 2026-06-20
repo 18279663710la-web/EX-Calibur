@@ -1,0 +1,47 @@
+{
+  "cases": [
+    {
+      "id": "architecture-bff",
+      "query": "架构文档中的核心业务路由层指的是什么？",
+      "expected_doc": "架构文档",
+      "expected_terms": [
+        "BFF",
+        "Backend For Frontend",
+        "业务网关层",
+        "多模态文件智能鉴别引擎"
+      ]
+    },
+    {
+      "id": "wechat-send-file",
+      "query": "微信通道中打开文件时应该怎么回传？",
+      "expected_doc": "架构文档",
+      "expected_terms": [
+        "微信",
+        "ClawBot",
+        "send-file",
+        "文件本体"
+      ]
+    },
+    {
+      "id": "data-poisoning",
+      "query": "第3讲 数据投毒攻击与防御中数据投毒是什么？",
+      "expected_doc": "第3讲_数据投毒攻击与防御",
+      "expected_terms": [
+        "数据投毒",
+        "攻击",
+        "防御"
+      ]
+    },
+    {
+      "id": "sync-quality",
+      "query": "文件同步脚本如何保证清洗后的内容保真？",
+      "expected_doc": "项目文档",
+      "expected_terms": [
+        "95%",
+        "Markdown",
+        "清洗",
+        "Dify"
+      ]
+    }
+  ]
+}

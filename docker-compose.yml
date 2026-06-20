@@ -107,7 +107,7 @@ services:
       SYNC_ONCE: ${SYNC_ONCE:-false}
       RAG_SYNC_PIPELINE: ${RAG_SYNC_PIPELINE:-deepseek}
       DEEPSEEK_API_KEY: ${CLOUDRAG_DEEPSEEK_API_KEY:-}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
     volumes:
       - ./knowledge:/app/knowledge:ro
