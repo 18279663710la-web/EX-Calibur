@@ -1,4 +1,7 @@
 import os
+import secrets
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -11,7 +14,7 @@ class Settings(BaseSettings):
     port: int = 8080
     frontend_port: int = 8081
 
-    jwt_secret_key: str = "dev-secret-change-in-production"
+    jwt_secret_key: str = ""
     jwt_algorithm: str = "HS256"
     access_token_expire_seconds: int = 7200
     refresh_token_expire_seconds: int = 604800
@@ -50,6 +53,21 @@ class Settings(BaseSettings):
         extra = "ignore"
 
 
+def _ensure_jwt_secret(settings: Settings) -> None:
+    if settings.jwt_secret_key and not settings.jwt_secret_key.startswith("change-me"):
+        return
+    secret_file = Path(settings.upload_dir) / ".jwt_secret"
+    if secret_file.exists():
+        settings.jwt_secret_key = secret_file.read_text().strip()
+        return
+    generated = secrets.token_hex(32)
+    secret_file.parent.mkdir(parents=True, exist_ok=True)
+    secret_file.write_text(generated)
+    settings.jwt_secret_key = generated
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    _ensure_jwt_secret(settings)
+    return settings
