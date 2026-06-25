@@ -10,6 +10,7 @@ import httpx
 from fastapi import UploadFile
 
 from ..config import get_settings
+from ..database import get_pool
 from ..models.chat import (
     ChatRequest,
     SSEDoneEvent,
@@ -403,6 +404,9 @@ async def chat_stream(
     token_index = 0
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     think_filter = ThinkBlockFilter()
+    accumulated_content = ""
+    accumulated_references: list[dict[str, Any]] = []
+    user_message_id = str(uuid.uuid4())
 
     yield _sse_line(
         "meta",
@@ -470,6 +474,7 @@ async def chat_stream(
                             token = think_filter.push(token)
                             if not token:
                                 continue
+                            accumulated_content += token
                             yield _sse_line(
                                 "message",
                                 SSEMessageToken(token=token, index=token_index).model_dump(),
@@ -482,6 +487,7 @@ async def chat_stream(
                             if chunks:
                                 chunks = _filter_visible_references(request.query, chunks)
                             if chunks:
+                                accumulated_references = chunks
                                 yield _sse_line(
                                     "references",
                                     SSEReferencesEvent(
@@ -575,6 +581,40 @@ async def chat_stream(
         usage.get("total_tokens", 0),
         latency_ms,
     )
+
+    # ---- 持久化对话和消息到 PostgreSQL ----
+    try:
+        pool = await get_pool()
+        title = request.query[:100] if request.query else "新对话"
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO conversations (id, title, model, user_id)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (id) DO UPDATE SET updated_at = NOW()""",
+                conversation_id, title, request.model, user_id,
+            )
+            await conn.execute(
+                """INSERT INTO messages (id, conversation_id, role, content)
+                   VALUES ($1, $2, 'user', $3)""",
+                user_message_id, conversation_id, request.query,
+            )
+            await conn.execute(
+                """INSERT INTO messages (id, conversation_id, role, content,
+                   prompt_tokens, completion_tokens, total_tokens,
+                   latency_ms, references_json)
+                   VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8)""",
+                str(uuid.uuid4()),
+                conversation_id,
+                accumulated_content,
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+                usage.get("total_tokens", 0),
+                latency_ms,
+                json.dumps(accumulated_references, ensure_ascii=False) if accumulated_references else None,
+            )
+    except Exception:
+        logger.exception("Failed to persist conversation to database")
+
     yield _sse_line(
         "done",
         SSEDoneEvent(
