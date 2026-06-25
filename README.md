@@ -17,7 +17,6 @@ Dify Chatflow：
 
 <img width="2112" height="1224" alt="Dify Chatflow" src="https://github.com/user-attachments/assets/1bdff0ad-d202-41f1-8761-54f052ed31a9" />
 
-`tests/`、`reports/`、`.pytest_cache/`、`.env`、运行时上传目录和同步账本不提交到 GitHub。
 
 ## 运行前准备
 
