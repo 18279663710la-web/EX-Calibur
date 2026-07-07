@@ -5,7 +5,7 @@
  * 成员 1 (前端架构) — 核心流式处理逻辑
  */
 
-import type { ChatRequest, SSEMetaEvent, SSEReferencesEvent, SSEToolCallEvent, SSEErrorEvent, SSEDoneEvent } from './api';
+import type { ChatRequest, CloudRagFileCard, SSEMetaEvent, SSEReferencesEvent, SSEToolCallEvent, SSEErrorEvent, SSEDoneEvent } from './api';
 import { getToken } from './api';
 
 // ---- 类型 ----
@@ -14,6 +14,7 @@ export interface StreamingState {
   conversationId: string | null;
   model: string;
   content: string;            // 累积的完整文本
+  fileCards: CloudRagFileCard[];
   references: SSEReferencesEvent | null;
   toolCalls: SSEToolCallEvent[];
   meta: SSEMetaEvent | null;
@@ -31,6 +32,79 @@ const BASE_URL = '/api/v1';
 export interface ParsedSSEEvent {
   event: string;
   data: Record<string, unknown>;
+}
+
+const AGENT_FILE_URL_PATTERN = /https?:\/\/[^\s<>"')]+\/files\/[A-Za-z0-9_-]+\.[a-fA-F0-9]{64}/g;
+
+function decodeBase64Url(value: string): string | null {
+  try {
+    const base64 = value.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(value.length / 4) * 4, '=');
+    const binary = atob(base64);
+    const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function filenameFromAgentFileUrl(url: string): string | null {
+  const token = url.split('/files/').pop();
+  if (!token) return null;
+  const payload = token.split('.')[0];
+  if (!payload) return null;
+  const decoded = decodeBase64Url(payload);
+  if (!decoded) return null;
+
+  try {
+    const data = JSON.parse(decoded) as { path?: unknown; filename?: unknown };
+    const rawName = typeof data.filename === 'string' ? data.filename : data.path;
+    if (typeof rawName !== 'string' || !rawName.trim()) return null;
+    return rawName.replace(/\\/g, '/').split('/').pop() || null;
+  } catch {
+    return null;
+  }
+}
+
+function sameOriginFileUrl(sourceUrl: string): string {
+  try {
+    return new URL(sourceUrl).pathname;
+  } catch {
+    const marker = '/files/';
+    const markerIndex = sourceUrl.indexOf(marker);
+    return markerIndex >= 0 ? sourceUrl.slice(markerIndex) : sourceUrl;
+  }
+}
+
+export function extractCloudRagFileCards(content: string): { content: string; fileCards: CloudRagFileCard[] } {
+  const fileCards: CloudRagFileCard[] = [];
+  let changed = false;
+  const cleaned = content.replace(AGENT_FILE_URL_PATTERN, (url) => {
+    const name = filenameFromAgentFileUrl(url);
+    if (!name) return url;
+    changed = true;
+    fileCards.push({ id: url, name, sourceUrl: url, url: sameOriginFileUrl(url) });
+    return '';
+  });
+
+  if (!changed) return { content, fileCards: [] };
+  return {
+    content: cleaned.replace(/[ \t]+\n/g, '\n').trim(),
+    fileCards,
+  };
+}
+
+export function normalizeCloudRagFileCards(
+  content: string,
+  existingCards: CloudRagFileCard[] = [],
+): { content: string; fileCards: CloudRagFileCard[] } {
+  const parsed = extractCloudRagFileCards(content);
+  const seen = new Set<string>();
+  const fileCards = [...existingCards, ...parsed.fileCards].filter((card) => {
+    if (seen.has(card.id)) return false;
+    seen.add(card.id);
+    return true;
+  });
+  return { content: parsed.content, fileCards };
 }
 
 export function parseSSEBlock(block: string): ParsedSSEEvent | null {
@@ -66,6 +140,7 @@ export function createChatStream(
     conversationId: existingState?.conversationId ?? null,
     model: existingState?.model ?? request.model,
     content: existingState?.content ?? '',
+    fileCards: existingState?.fileCards ?? [],
     references: existingState?.references ?? null,
     toolCalls: existingState?.toolCalls ?? [],
     meta: existingState?.meta ?? null,
@@ -179,6 +254,9 @@ function handleSSEEvent(
       // 逐 token 追加 —— 实现打字机效果
       const msg = data as unknown as { token: string; index: number };
       state.content += msg.token;
+      const normalized = normalizeCloudRagFileCards(state.content, state.fileCards);
+      state.content = normalized.content;
+      state.fileCards = normalized.fileCards;
       break;
     }
 
@@ -216,6 +294,7 @@ export function createMockChatStream(
     conversationId: 'mock_conv_001',
     model: 'gpt-4o',
     content: '',
+    fileCards: [],
     references: null,
     toolCalls: [],
     meta: null,

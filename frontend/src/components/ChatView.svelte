@@ -1,8 +1,8 @@
 <script lang="ts">
   import { toastError, toastInfo } from '../lib/stores';
-  import { kbApi, type ChatRequest, type ReferenceChunk } from '../lib/api';
-  import { createChatStream, type StreamingState } from '../lib/sse';
-  import { Send, Paperclip, FileText, Bot, X, StopCircle } from 'lucide-svelte';
+  import { kbApi, type ChatRequest, type CloudRagFileCard, type MessageItem, type ReferenceChunk } from '../lib/api';
+  import { createChatStream, normalizeCloudRagFileCards, type StreamingState } from '../lib/sse';
+  import { Send, Paperclip, FileText, Bot, X, StopCircle, Download } from 'lucide-svelte';
 
   const MAX_CHAT_UPLOAD_FILES = 5;
   const MAX_CHAT_UPLOAD_BYTES = 15 * 1024 * 1024;
@@ -42,7 +42,11 @@
 
   let query = $state('');
   let activeConvId = $state<string | null>(null);
-  let messages = $state<Array<{ id: string; role: string; content: string; files?: Array<{ id: string; original_name: string; rag_mode?: string; syncStatus?: string }>; references?: ReferenceChunk[] | null; usage?: { total_tokens: number } | null; latency_ms?: number | null; created_at: string }>>([]);
+  type ChatMessage = MessageItem & {
+    files?: Array<{ id: string; original_name: string; rag_mode?: string; syncStatus?: string }>;
+    fileCards?: CloudRagFileCard[];
+  };
+  let messages = $state<ChatMessage[]>([]);
   let loadingConv = $state(false);
   let activeAbort = $state<(() => void) | null>(null);
   let streamingState = $state<StreamingState | null>(null);
@@ -190,7 +194,7 @@
     try {
       const res = await kbApi.conversationDetail(convId);
       if (res.data) {
-        messages = res.data.messages;
+        messages = res.data.messages.map(normalizeAssistantMessage);
       }
     } catch {
       toastError('加载对话失败');
@@ -252,15 +256,16 @@
             activeConvId = state.conversationId;
             onConversationChange(state.conversationId);
           }
-          messages = [...messages, {
+          messages = [...messages, normalizeAssistantMessage({
             id: state.done.message_id,
             role: 'assistant',
             content: state.content,
+            fileCards: state.fileCards,
             references: state.references?.chunks || null,
             usage: state.done.usage,
             latency_ms: state.done.latency_ms,
             created_at: state.done.finished_at,
-          }];
+          })];
           streamingState = null;
           activeAbort = null;
           onConversationListChanged();
@@ -298,6 +303,23 @@
     text = text.replace(/\n\n/g, '<br><br>');
     text = text.replace(/\n/g, '<br>');
     return text;
+  }
+
+  function normalizeAssistantMessage(message: ChatMessage): ChatMessage {
+    if (message.role !== 'assistant') return message;
+    const normalized = normalizeCloudRagFileCards(message.content, message.fileCards || []);
+    return {
+      ...message,
+      content: normalized.content,
+      fileCards: normalized.fileCards,
+    };
+  }
+
+  function formatFileSize(sizeBytes?: number | null) {
+    if (!sizeBytes || sizeBytes <= 0) return '';
+    if (sizeBytes < 1024) return `${sizeBytes} B`;
+    if (sizeBytes < 1024 * 1024) return `${(sizeBytes / 1024).toFixed(1)} KB`;
+    return `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
   }
 </script>
 
@@ -351,6 +373,29 @@
                 {/if}
               </div>
 
+              {#if msg.role === 'assistant' && msg.fileCards && msg.fileCards.length > 0}
+                <div class="mt-3 flex flex-col gap-2">
+                  {#each msg.fileCards as fileCard (fileCard.id)}
+                    <a
+                      class="flex max-w-full items-center gap-3 border-2 border-black bg-white p-3 text-black no-underline transition-none hover:bg-black hover:text-white"
+                      href={fileCard.url}
+                      download
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <FileText class="h-6 w-6 shrink-0" />
+                      <span class="min-w-0 flex-1">
+                        <span class="block truncate font-semibold">{fileCard.name}</span>
+                        {#if formatFileSize(fileCard.sizeBytes)}
+                          <span class="block font-mono text-xs uppercase tracking-widest opacity-70">{formatFileSize(fileCard.sizeBytes)}</span>
+                        {/if}
+                      </span>
+                      <Download class="h-5 w-5 shrink-0" />
+                    </a>
+                  {/each}
+                </div>
+              {/if}
+
               {#if msg.files && msg.files.length > 0}
                 <div class="mt-3 flex flex-col gap-2">
                   {#each msg.files as f (f.id)}
@@ -387,6 +432,28 @@
               <div class="whitespace-pre-wrap text-[16px] leading-7">
                 {streamingState.content}<span class="cursor-blink"></span>
               </div>
+              {#if streamingState.fileCards.length > 0}
+                <div class="mt-3 flex flex-col gap-2">
+                  {#each streamingState.fileCards as fileCard (fileCard.id)}
+                    <a
+                      class="flex max-w-full items-center gap-3 border-2 border-black bg-white p-3 text-black no-underline transition-none hover:bg-black hover:text-white"
+                      href={fileCard.url}
+                      download
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <FileText class="h-6 w-6 shrink-0" />
+                      <span class="min-w-0 flex-1">
+                        <span class="block truncate font-semibold">{fileCard.name}</span>
+                        {#if formatFileSize(fileCard.sizeBytes)}
+                          <span class="block font-mono text-xs uppercase tracking-widest opacity-70">{formatFileSize(fileCard.sizeBytes)}</span>
+                        {/if}
+                      </span>
+                      <Download class="h-5 w-5 shrink-0" />
+                    </a>
+                  {/each}
+                </div>
+              {/if}
             </div>
           </div>
         {/if}

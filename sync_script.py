@@ -31,6 +31,15 @@ from PyPDF2 import PdfReader
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+
+def first_env(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
 # You can edit these constants directly, or set the matching environment vars.
 DIFY_BASE_URL = os.getenv("DIFY_BASE_URL", "http://localhost/v1")
 DATASET_API_KEY = os.getenv("DIFY_DATASET_API_KEY", "")
@@ -40,15 +49,33 @@ SYNC_LEDGER_PATH = Path(os.getenv("SYNC_LEDGER_PATH", PROJECT_ROOT / "sync_ledge
 STRUCTURED_MARKDOWN_DIR = Path(
     os.getenv("STRUCTURED_MARKDOWN_DIR", PROJECT_ROOT / "structured_markdown")
 )
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+CLEANING_MODEL_API_KEY = first_env(
+    "CLEANING_MODEL_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "CLOUDRAG_DEEPSEEK_API_KEY",
+)
+CLEANING_MODEL_BASE_URL = first_env(
+    "CLEANING_MODEL_BASE_URL",
+    "DEEPSEEK_BASE_URL",
+    default="https://api.deepseek.com",
+)
+CLEANING_MODEL_NAME = first_env(
+    "CLEANING_MODEL_NAME",
+    "DEEPSEEK_MODEL",
+    default="deepseek-v4-pro",
+)
+
+# Backward-compatible aliases for older imports/configuration.
+DEEPSEEK_API_KEY = CLEANING_MODEL_API_KEY
+DEEPSEEK_BASE_URL = CLEANING_MODEL_BASE_URL
+DEEPSEEK_MODEL = CLEANING_MODEL_NAME
 
 UPLOAD_TIMEOUT_SECONDS = int(os.getenv("DIFY_DATASET_UPLOAD_TIMEOUT", "300"))
 CLEANED_MARKDOWN_MIN_BODY_SIMILARITY = float(
     os.getenv("CLEANED_MARKDOWN_MIN_BODY_SIMILARITY", "0.95")
 )
 PIPELINE_VERSION = os.getenv("RAG_SYNC_PIPELINE_VERSION", "deepseek-preserve-v3")
+MODEL_PIPELINES = {"model", "deepseek"}
 SUPPORTED_EXTENSIONS = {
     ".csv",
     ".doc",
@@ -74,6 +101,10 @@ class ConfigurationError(RuntimeError):
 class Cleaner(Protocol):
     def clean(self, raw_text: str) -> str:
         """Return cleaned markdown text."""
+
+
+def is_model_pipeline(pipeline: str) -> bool:
+    return pipeline in MODEL_PIPELINES
 
 
 @dataclass(frozen=True)
@@ -191,7 +222,7 @@ def needs_upload(file_state: FileState, ledger: dict[str, Any], *, pipeline: str
         return True
     if record.get("pipeline", "direct") != pipeline:
         return True
-    if pipeline == "deepseek" and record.get("pipeline_version") != PIPELINE_VERSION:
+    if is_model_pipeline(pipeline) and record.get("pipeline_version") != PIPELINE_VERSION:
         return True
     if not record.get("document_id"):
         return True
@@ -203,7 +234,7 @@ def needs_upload(file_state: FileState, ledger: dict[str, Any], *, pipeline: str
 
 def expected_remote_name(relative_path: str, pipeline: str) -> str:
     path = Path(relative_path)
-    if pipeline == "deepseek":
+    if is_model_pipeline(pipeline):
         return path.with_suffix(".md").name
     return path.name
 
@@ -317,7 +348,7 @@ def refresh_ledger_whitelist(
         )
         if whitelist_entry:
             pipeline_version_matches = (
-                pipeline != "deepseek"
+                not is_model_pipeline(pipeline)
                 or record.get("pipeline_version") == PIPELINE_VERSION
             )
             if not pipeline_version_matches:
@@ -347,7 +378,7 @@ def refresh_ledger_whitelist(
                         "pipeline": pipeline,
                     }
                 )
-                if pipeline == "deepseek":
+                if is_model_pipeline(pipeline):
                     record["pipeline_version"] = PIPELINE_VERSION
         elif record.get("document_id"):
             record.pop("document_id", None)
@@ -618,14 +649,14 @@ def extract_source_text(path: Path) -> str:
         return sanitize_text_for_json(extract_pdf_text(path))
     if suffix in {".md", ".markdown", ".txt"}:
         return sanitize_text_for_json(path.read_text(encoding="utf-8"))
-    raise ConfigurationError(f"DeepSeek pipeline does not support source type: {path.suffix}")
+    raise ConfigurationError(f"Model cleaning pipeline does not support source type: {path.suffix}")
 
 
 def sanitize_text_for_json(text: str) -> str:
     return text.encode("utf-8", errors="ignore").decode("utf-8")
 
 
-DEEPSEEK_SYSTEM_PROMPT = """你是一个顶尖的中文技术文档解析专家与 RAG（检索增强生成）知识库结构化专家。请将以下通过 OCR 或粗略提取的、排版混乱的源文本，重构成高质量、易于 RAG 精准检索的分段 Markdown 文档。
+CLEANING_MODEL_SYSTEM_PROMPT = """你是一个顶尖的中文技术文档解析专家与 RAG（检索增强生成）知识库结构化专家。请将以下通过 OCR 或粗略提取的、排版混乱的源文本，重构成高质量、易于 RAG 精准检索的分段 Markdown 文档。
 
 核心目标：
 1. 最大化保真：100% 保留源文档中的技术细节。严禁润色、删减、归纳、压缩核心正文。
@@ -668,13 +699,16 @@ DEEPSEEK_SYSTEM_PROMPT = """你是一个顶尖的中文技术文档解析专家�
 源文本内容如下，请开始进行结构化清洗："""
 
 
-class DeepSeekCleaner:
+DEEPSEEK_SYSTEM_PROMPT = CLEANING_MODEL_SYSTEM_PROMPT
+
+
+class OpenAICompatibleCleaner:
     def __init__(
         self,
         *,
         api_key: str,
-        base_url: str = DEEPSEEK_BASE_URL,
-        model: str = DEEPSEEK_MODEL,
+        base_url: str = CLEANING_MODEL_BASE_URL,
+        model: str = CLEANING_MODEL_NAME,
         timeout: int = 180,
         chunk_chars: int = 18000,
     ):
@@ -701,7 +735,7 @@ class DeepSeekCleaner:
             json={
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
+                    {"role": "system", "content": CLEANING_MODEL_SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": f"请对以下源文本内容{chunk_note}进行结构化清洗：\n\n{raw_text}",
@@ -714,18 +748,21 @@ class DeepSeekCleaner:
         )
         if response.status_code >= 400:
             raise requests.HTTPError(
-                f"DeepSeek HTTP {response.status_code} {response.reason}: {response.text[:1000]}",
+                f"Cleaning model HTTP {response.status_code} {response.reason}: {response.text[:1000]}",
                 response=response,
             )
         payload = response.json()
         choices = payload.get("choices")
         if not choices or not isinstance(choices, list):
-            raise RuntimeError("DeepSeek response missing choices")
+            raise RuntimeError("Cleaning model response missing choices")
         message = choices[0].get("message") if isinstance(choices[0], dict) else {}
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("DeepSeek response missing cleaned markdown")
+            raise RuntimeError("Cleaning model response missing cleaned markdown")
         return content.strip()
+
+
+DeepSeekCleaner = OpenAICompatibleCleaner
 
 
 def split_text(text: str, chunk_chars: int) -> list[str]:
@@ -800,11 +837,11 @@ def build_upload_candidates(
             )
         return candidates
 
-    if pipeline != "deepseek":
+    if not is_model_pipeline(pipeline):
         raise ConfigurationError(f"Unsupported pipeline: {pipeline}")
 
     if cleaner is None:
-        raise ConfigurationError("Missing required config for DeepSeek pipeline: DEEPSEEK_API_KEY")
+        raise ConfigurationError("Missing required config for model pipeline: CLEANING_MODEL_API_KEY")
 
     candidates: list[UploadCandidate] = []
     for file_state in pending:
@@ -814,12 +851,12 @@ def build_upload_candidates(
             ledger_key=file_state.relative_path,
         )
         if file_state.path.suffix.lower() not in {".docx", ".pdf", ".md", ".markdown", ".txt"}:
-            print(f"[SKIP] DeepSeek pipeline does not handle this file: {file_state.relative_path}")
+            print(f"[SKIP] Model cleaning pipeline does not handle this file: {file_state.relative_path}")
             continue
         try:
             print(f"[CLEAN] extracting source text: {file_state.relative_path}")
             raw_text = extract_source_text(file_state.path)
-            print(f"[CLEAN] requesting DeepSeek structured markdown: {file_state.relative_path}")
+            print(f"[CLEAN] requesting model structured markdown: {file_state.relative_path}")
             markdown = cleaner.clean(raw_text)
             markdown = ensure_markdown_body_fidelity(raw_text, markdown, file_state.path.name)
             output_path = markdown_output_path(file_state, archive_dir)
@@ -900,7 +937,7 @@ def record_success(
         "batch": response_payload.get("batch"),
         "pipeline": pipeline,
     }
-    if pipeline == "deepseek":
+    if is_model_pipeline(pipeline):
         record["pipeline_version"] = PIPELINE_VERSION
     if candidate.generated_relative_path:
         record["generated_file"] = candidate.generated_relative_path
@@ -951,9 +988,12 @@ def run_sync(
     dry_run: bool = False,
     session: requests.Session | None = None,
     archive_dir: Path = STRUCTURED_MARKDOWN_DIR,
-    deepseek_api_key: str = DEEPSEEK_API_KEY,
-    deepseek_base_url: str = DEEPSEEK_BASE_URL,
-    deepseek_model: str = DEEPSEEK_MODEL,
+    model_api_key: str | None = None,
+    model_base_url: str | None = None,
+    model_name: str | None = None,
+    deepseek_api_key: str | None = None,
+    deepseek_base_url: str | None = None,
+    deepseek_model: str | None = None,
     pipeline: str = "direct",
     cleaner: Cleaner | None = None,
     clear_remote: bool = False,
@@ -980,15 +1020,19 @@ def run_sync(
         )
 
     validate_config(base_url, dataset_api_key, dataset_id)
-    if pipeline == "deepseek" and cleaner is None:
-        if not deepseek_api_key:
+    effective_model_api_key = model_api_key or deepseek_api_key or CLEANING_MODEL_API_KEY
+    effective_model_base_url = model_base_url or deepseek_base_url or CLEANING_MODEL_BASE_URL
+    effective_model_name = model_name or deepseek_model or CLEANING_MODEL_NAME
+
+    if is_model_pipeline(pipeline) and cleaner is None:
+        if not effective_model_api_key:
             raise ConfigurationError(
-                "Missing required config for DeepSeek pipeline: DEEPSEEK_API_KEY"
+                "Missing required config for model pipeline: CLEANING_MODEL_API_KEY"
             )
-        cleaner = DeepSeekCleaner(
-            api_key=deepseek_api_key,
-            base_url=deepseek_base_url,
-            model=deepseek_model,
+        cleaner = OpenAICompatibleCleaner(
+            api_key=effective_model_api_key,
+            base_url=effective_model_base_url,
+            model=effective_model_name,
         )
 
     active_session = session or requests.Session()
@@ -1026,7 +1070,7 @@ def run_sync(
     uploaded = 0
     failed = 0
     upload_payload = (
-        dify_custom_markdown_payload() if pipeline == "deepseek" else dify_document_payload()
+        dify_custom_markdown_payload() if is_model_pipeline(pipeline) else dify_document_payload()
     )
     for candidate in candidates:
         try:
@@ -1089,25 +1133,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pipeline",
-        choices=["direct", "deepseek"],
+        choices=["direct", "model", "deepseek"],
         default=os.getenv("RAG_SYNC_PIPELINE", "direct"),
-        help="direct uploads source files; deepseek cleans .docx files to markdown first.",
+        help="direct uploads source files; model cleans files through an OpenAI-compatible model. deepseek is a legacy alias.",
     )
     parser.add_argument(
         "--archive-dir",
         type=Path,
         default=STRUCTURED_MARKDOWN_DIR,
-        help="Directory for DeepSeek-cleaned markdown files.",
+        help="Directory for model-cleaned markdown files.",
     )
     parser.add_argument(
+        "--model-base-url",
         "--deepseek-base-url",
-        default=DEEPSEEK_BASE_URL,
-        help="DeepSeek OpenAI-compatible API base URL.",
+        dest="model_base_url",
+        default=CLEANING_MODEL_BASE_URL,
+        help="OpenAI-compatible cleaning model API base URL.",
     )
     parser.add_argument(
+        "--model-name",
         "--deepseek-model",
-        default=DEEPSEEK_MODEL,
-        help="DeepSeek model name.",
+        dest="model_name",
+        default=CLEANING_MODEL_NAME,
+        help="Cleaning model name.",
     )
     parser.add_argument(
         "--clear-remote",
@@ -1128,9 +1176,9 @@ def main() -> int:
             dataset_id=args.dataset_id,
             dry_run=args.dry_run,
             archive_dir=args.archive_dir,
-            deepseek_api_key=DEEPSEEK_API_KEY,
-            deepseek_base_url=args.deepseek_base_url,
-            deepseek_model=args.deepseek_model,
+            model_api_key=CLEANING_MODEL_API_KEY,
+            model_base_url=args.model_base_url,
+            model_name=args.model_name,
             pipeline=args.pipeline,
             clear_remote=args.clear_remote,
         )

@@ -134,9 +134,10 @@ Invoke-RestMethod http://localhost:8080/api/v1/clawbot/weixin-state
 ```env
 DIFY_DATASET_API_KEY=your-dataset-api-key
 DIFY_DATASET_ID=your-dataset-id
-CLOUDRAG_DEEPSEEK_API_KEY=your-cleaning-model-key
-DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-DEEPSEEK_MODEL=deepseek-v4-pro
+CLEANING_MODEL_API_KEY=your-cleaning-model-key
+CLEANING_MODEL_BASE_URL=https://api.deepseek.com/v1
+CLEANING_MODEL_NAME=deepseek-chat
+RAG_SYNC_PIPELINE=model
 SYNC_INTERVAL_SECONDS=60
 SYNC_RUN_ON_START=true
 ```
@@ -145,10 +146,10 @@ SYNC_RUN_ON_START=true
 清洗模型接口使用 OpenAI-compatible `chat/completions` 格式，所以也可以换成阿里云百炼等兼容端点，例如：
 
 ```env
-DEEPSEEK_BASE_URL=https://your-workspace-id.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
-DEEPSEEK_MODEL=qwen3.7-plus
+CLEANING_MODEL_BASE_URL=https://your-workspace-id.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+CLEANING_MODEL_NAME=qwen-plus
 ```
-如果这些变量为空，同步容器会保持运行但跳过上传，不影响 Web 和微信网关启动。
+如果 Dify 知识库变量为空，同步容器会保持运行但跳过上传，不影响 Web 和微信网关启动；如果选择 `model` 管线，则需要提供 `CLEANING_MODEL_API_KEY`。
 
 也可以本地手动运行同步脚本：
 

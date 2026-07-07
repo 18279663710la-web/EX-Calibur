@@ -102,10 +102,19 @@ export interface MessageItem {
   id: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
+  fileCards?: CloudRagFileCard[];
   references?: ReferenceChunk[] | null;
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
   latency_ms?: number | null;
   created_at: string;
+}
+
+export interface CloudRagFileCard {
+  id: string;
+  name: string;
+  url: string;
+  sourceUrl?: string;
+  sizeBytes?: number | null;
 }
 
 export interface ConversationDetail {

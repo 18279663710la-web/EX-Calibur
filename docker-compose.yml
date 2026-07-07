@@ -1,6 +1,6 @@
 # ============================================================
 # CloudRAG-Hub Docker Compose 一键部署
-# 编排 4 个服务: frontend + backend + knowledge-sync + postgres
+# 编排 5 个服务: frontend + backend + agent-server + knowledge-sync + postgres
 # ============================================================
 
 name: cloudrag-hub
@@ -105,16 +105,40 @@ services:
       SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-60}
       SYNC_RUN_ON_START: ${SYNC_RUN_ON_START:-true}
       SYNC_ONCE: ${SYNC_ONCE:-false}
-      RAG_SYNC_PIPELINE: ${RAG_SYNC_PIPELINE:-deepseek}
-      DEEPSEEK_API_KEY: ${CLOUDRAG_DEEPSEEK_API_KEY:-}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
-      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      RAG_SYNC_PIPELINE: ${RAG_SYNC_PIPELINE:-model}
+      CLEANING_MODEL_API_KEY: ${CLEANING_MODEL_API_KEY:-}
+      CLEANING_MODEL_BASE_URL: ${CLEANING_MODEL_BASE_URL:-}
+      CLEANING_MODEL_NAME: ${CLEANING_MODEL_NAME:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      CLOUDRAG_DEEPSEEK_API_KEY: ${CLOUDRAG_DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-}
     volumes:
       - ./knowledge:/app/knowledge:ro
       - ./sync_ledger.json:/app/state/sync_ledger.json
       - structured_markdown_data:/app/structured_markdown
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - cloudrag-net
+      - dify-net
+
+  # ---- Agent 文件回传服务（供 Dify HTTP_OPEN 调用）----
+  agent-server:
+    build:
+      context: .
+      dockerfile: agent-server.Dockerfile
+    container_name: cloudrag-agent-server
+    restart: unless-stopped
+    environment:
+      AGENT_PORT: 8090
+      AGENT_KNOWLEDGE_DIR: /app/knowledge
+      AGENT_PUBLIC_BASE_URL: ${AGENT_PUBLIC_BASE_URL:-http://localhost:8090}
+      AGENT_DOWNLOAD_SECRET: ${AGENT_DOWNLOAD_SECRET:-change-me-agent-download-secret}
+    ports:
+      - "${AGENT_PORT:-8090}:8090"
+    volumes:
+      - ./knowledge:/app/knowledge:ro
     networks:
       - cloudrag-net
       - dify-net

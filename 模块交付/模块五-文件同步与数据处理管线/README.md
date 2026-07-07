@@ -2,7 +2,7 @@
 
 ## 职责
 
-本地知识库文件 → DeepSeek 大模型智能清洗 → 结构化 Markdown → Dify Dataset 上传的完整数据管线。同时提供本地文件 HTTP 服务，供 Dify 工作流通过 HTTP 节点直接操作本地文件。
+本地知识库文件 → OpenAI-compatible 通用模型智能清洗 → 结构化 Markdown → Dify Dataset 上传的完整数据管线。同时提供本地文件 HTTP 服务，供 Dify 工作流通过 HTTP 节点直接操作本地文件。
 
 ## 交付清单
 
@@ -10,7 +10,7 @@
 
 | 文件 | 说明 |
 |------|------|
-| `sync_script.py` | 文件同步脚本核心（1230行）：双管线（direct/deepseek）、文本提取（DOCX/PDF/MD/TXT）、DeepSeek API 清洗、内容保真度校验（SequenceMatcher ≥95%）、检索增强处理（中文标题升级为 ##）、同步账本管理、Dify Dataset 上传 |
+| `sync_script.py` | 文件同步脚本核心（1230行）：双管线（direct/model）、文本提取（DOCX/PDF/MD/TXT）、OpenAI-compatible 模型清洗、内容保真度校验（SequenceMatcher ≥95%）、检索增强处理（中文标题升级为 ##）、同步账本管理、Dify Dataset 上传 |
 | `agent_server.py` | 本地文件 HTTP 服务（153行）：4 个端点（/health、/search、/open、/upload），供 Dify 工作流 HTTP 节点调用 |
 | `knowledge-sync.Dockerfile` | 同步容器镜像定义（Python 3.12-slim） |
 | `knowledge-sync-entrypoint.sh` | 容器入口脚本：启动时运行一次 → 循环模式（默认 60s 间隔）→ 一次性模式 |
@@ -19,14 +19,14 @@
 
 ### 双管线对比
 
-| 特性 | direct 管线 | deepseek 管线 |
+| 特性 | direct 管线 | model 管线 |
 |------|------------|---------------|
-| 参数 | `--pipeline direct` | `--pipeline deepseek` |
-| 流程 | 原文件直传 Dify | 提取文本 → DeepSeek 清洗 → 上传 Markdown |
+| 参数 | `--pipeline direct` | `--pipeline model` |
+| 流程 | 原文件直传 Dify | 提取文本 → 通用模型清洗 → 上传 Markdown |
 | 分段 | Dify 自动分段 | 自定义 `\n## ` 分隔，≤1400 tokens |
 | 适用 | 纯文本/md 文件 | PDF/DOCX 等排版复杂文件 |
 
-### DeepSeek 清洗规则文档
+### 模型清洗规则文档
 
 | 规则类别 | 说明 |
 |----------|------|
@@ -62,9 +62,9 @@
 
 | 上游模块 | 依赖方式 |
 |----------|----------|
-| 模块一（部署） | docker-compose 提供 LOCAL_FILE_DIR、DIFY_DATASET_API_KEY、CLOUDRAG_DEEPSEEK_API_KEY 等环境变量 |
+| 模块一（部署） | docker-compose 提供 LOCAL_FILE_DIR、DIFY_DATASET_API_KEY、CLEANING_MODEL_API_KEY 等环境变量 |
 | 外部：Dify Dataset | 需要配置 DIFY_DATASET_ID 和 DIFY_DATASET_API_KEY |
-| 外部：DeepSeek API | 需要配置 CLOUDRAG_DEEPSEEK_API_KEY（deepseek 管线必需） |
+| 外部：OpenAI-compatible 模型 API | 需要配置 CLEANING_MODEL_API_KEY、CLEANING_MODEL_BASE_URL、CLEANING_MODEL_NAME（model 管线必需） |
 
 ## 下游对接
 
@@ -77,7 +77,7 @@
 ## 交付标准
 
 - [ ] `python sync_script.py --source-dir knowledge --pipeline direct --dry-run` 正确列出待上传文件
-- [ ] `python sync_script.py --source-dir knowledge --pipeline deepseek` 正确清洗 DOCX/PDF 并输出 Markdown
+- [ ] `python sync_script.py --source-dir knowledge --pipeline model` 正确清洗 DOCX/PDF 并输出 Markdown
 - [ ] 清洗后的 Markdown 与原文相似度 ≥95%
 - [ ] 同步账本增量检测正确：未修改文件不重复上传
 - [ ] agent_server 启动后 /health 正常响应
